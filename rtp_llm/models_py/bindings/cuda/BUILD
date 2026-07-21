@@ -245,6 +245,7 @@ cc_library(
     deps = torch_deps() + [
         "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
         "//rtp_llm/models_py/bindings/core:types_hdr",
+        "@local_config_cuda//cuda:cudart",
         "//rtp_llm/models_py/bindings/cuda/kernels:scaled_fp8_quant",
         "//rtp_llm/models_py/bindings/cuda/kernels:cuda_graph_prepare",
         "//rtp_llm/models_py/bindings/common/kernels:kernels_ep_util",

@@ -20,6 +20,7 @@
 #include "rtp_llm/models_py/bindings/cuda/DebugKernelOp.h"
 #include "rtp_llm/models_py/bindings/cuda/UserBuffersOp.h"
 #include "rtp_llm/models_py/bindings/cuda/FakeBalanceExpertOp.h"
+#include "rtp_llm/models_py/bindings/cuda/GreenContextOp.h"
 
 #include "rtp_llm/models_py/bindings/cuda/kernels/mla_quant_kernel.h"
 #include "rtp_llm/models_py/bindings/cuda/kernels/dsv4_persistent_topk.h"
@@ -368,6 +369,7 @@ void registerBaseCudaBindings(py::module& rtp_ops_m) {
     registerTrtFp8QuantOp(rtp_ops_m);
     registerUserBuffersOp(rtp_ops_m);
     registerFakeBalanceExpertOp(rtp_ops_m);
+    rtp_llm::registerGreenContextStream(rtp_ops_m);
 }
 
 }  // namespace torch_ext
