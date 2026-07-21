@@ -52,4 +52,30 @@ void per_token_group_quant_fp8_v2(at::Tensor&                         input,
         input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0, fuse_silu_and_mul, masked_m);
 }
 
+void per_token_group_quant_fp8_trigger_preloadb(at::Tensor& input,
+                                                at::Tensor& output_q,
+                                                at::Tensor& output_s,
+                                                int64_t     group_size,
+                                                double      eps,
+                                                double      fp8_min,
+                                                double      fp8_max,
+                                                bool        scale_ue8m0) {
+    per_token_group_quant_8bit_trigger_preloadb(
+        input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0);
+}
+
+void per_token_group_quant_fp8_v2_trigger_preloadb(at::Tensor&                         input,
+                                                   at::Tensor&                         output_q,
+                                                   at::Tensor&                         output_s,
+                                                   int64_t                             group_size,
+                                                   double                              eps,
+                                                   double                              fp8_min,
+                                                   double                              fp8_max,
+                                                   bool                                scale_ue8m0,
+                                                   bool                                fuse_silu_and_mul,
+                                                   const std::optional<torch::Tensor>& masked_m) {
+    sgl_per_token_group_quant_8bit_v2_trigger_preloadb(
+        input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0, fuse_silu_and_mul, masked_m);
+}
+
 }  // namespace torch_ext

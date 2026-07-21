@@ -19,12 +19,16 @@ if is_cuda():
     from rtp_llm.ops.compute_ops import (
         per_tensor_quant_fp8,
         per_token_group_quant_fp8,
+        per_token_group_quant_fp8_trigger_preloadb,
         per_token_group_quant_fp8_v2,
+        per_token_group_quant_fp8_v2_trigger_preloadb,
         per_token_group_quant_int8,
         per_token_quant_fp8,
     )
 else:
     logging.info("skip import fp8 quant from rtp_llm_ops for non cuda platform")
+    per_token_group_quant_fp8_trigger_preloadb = None  # type: ignore
+    per_token_group_quant_fp8_v2_trigger_preloadb = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +205,91 @@ def sgl_per_token_group_quant_fp8(
             )
         else:
             per_token_group_quant_fp8(
+                x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+            )
+
+    return x_q, x_s
+
+
+def sgl_per_token_group_quant_fp8_trigger_preloadb(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+):
+    """Same contract as ``sgl_per_token_group_quant_fp8``, but launches the
+    ``*_trigger_preloadb`` CUDA kernels (early
+    ``cudaTriggerProgrammaticLaunchCompletion``). Opt-in for DeepGEMM preloadb
+    A/B experiments; does not replace the default quant path.
+    """
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.is_contiguous(), "`x` is not contiguous"
+    if per_token_group_quant_fp8_trigger_preloadb is None:
+        raise RuntimeError(
+            "per_token_group_quant_fp8_trigger_preloadb is unavailable on this platform"
+        )
+
+    out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
+    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
+    x_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=out_shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    )
+    if x.shape[0] > 0:
+        quant_kernel = os.environ.get("DSV4_FP8_QUANT_KERNEL", "auto").strip().lower()
+
+        def can_use_v2() -> bool:
+            if group_size not in (16, 32, 64, 128):
+                return False
+            if masked_m is not None and not fuse_silu_and_mul:
+                return False
+            return True
+
+        def should_auto_use_v2() -> bool:
+            if not can_use_v2():
+                return False
+            if masked_m is not None or fuse_silu_and_mul:
+                return True
+            return x.numel() >= 4 * 1024 * 1024
+
+        use_v2 = False
+        if quant_kernel == "legacy":
+            use_v2 = False
+        elif quant_kernel == "v2":
+            use_v2 = True
+        elif quant_kernel != "auto":
+            raise ValueError(
+                "DSV4_FP8_QUANT_KERNEL must be one of auto, legacy, v2; "
+                f"got {quant_kernel!r}"
+            )
+        else:
+            use_v2 = should_auto_use_v2() or masked_m is not None
+
+        if use_v2:
+            per_token_group_quant_fp8_v2_trigger_preloadb(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                fuse_silu_and_mul,
+                masked_m,
+            )
+        else:
+            per_token_group_quant_fp8_trigger_preloadb(
                 x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
             )
 
@@ -442,9 +531,7 @@ def requant_weight_ue8m0(
     )
     *batch_dims, n, k = weight_dequant.shape
     weight_dequant_flat = weight_dequant.view((-1, k))
-    out_w_flat, out_s_flat = per_block_cast_to_fp8(
-        weight_dequant_flat, use_ue8m0=True
-    )
+    out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat, use_ue8m0=True)
 
     out_w = out_w_flat.view((*batch_dims, n, k))
     out_s = out_s_flat.view(

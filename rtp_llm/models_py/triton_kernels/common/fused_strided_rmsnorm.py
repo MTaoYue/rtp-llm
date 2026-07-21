@@ -188,6 +188,58 @@ def _fused_strided_rmsnorm_singlepass_kernel(
             )
 
 
+@triton.jit
+def _fused_strided_rmsnorm_fp8_kernel_trigger_preloadb(
+    x_ptr,
+    weight_ptr,
+    bf16_out_ptr,
+    fp8_out_ptr,
+    scale_out_ptr,
+    H: tl.constexpr,
+    eps,
+    fp8_max,
+    fp8_min,
+    stride_x_t,
+    stride_b_t,
+    stride_o_t,
+    stride_scale_t,
+    stride_scale_g,
+    BLOCK_N: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    HAS_BF16_OUT: tl.constexpr,
+    HAS_FP8_OUT: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
+):
+    """PDL producer variant: early gdc_launch_dependents for DeepGEMM preloadb.
+
+    Equivalent to ``cudaTriggerProgrammaticLaunchCompletion()``. Launched with
+    a normal Triton launch (no ``launch_pdl``). Opt-in via the
+    ``*_trigger_preloadb`` public wrappers.
+    """
+    tl.extra.cuda.gdc_launch_dependents()
+    _fused_strided_rmsnorm_singlepass_kernel(
+        x_ptr,
+        weight_ptr,
+        bf16_out_ptr,
+        fp8_out_ptr,
+        scale_out_ptr,
+        H,
+        eps,
+        fp8_max,
+        fp8_min,
+        stride_x_t,
+        stride_b_t,
+        stride_o_t,
+        stride_scale_t,
+        stride_scale_g,
+        BLOCK_N,
+        GROUP_SIZE,
+        HAS_BF16_OUT,
+        HAS_FP8_OUT,
+        SCALE_UE8M0,
+    )
+
+
 def _select_num_warps(H: int) -> int:
     if H <= 512:
         return 2
@@ -434,6 +486,138 @@ def fused_strided_rmsnorm_per_token_fp8_quant_with_bf16_output(
     grid = (T,)
 
     _fused_strided_rmsnorm_singlepass_kernel[grid](
+        x,
+        weight,
+        bf16_out,
+        fp8_out,
+        scale_out,
+        H,
+        eps,
+        fp8_max,
+        fp8_min,
+        x.stride(0),
+        bf16_out.stride(0),
+        fp8_out.stride(0),
+        scale_out.stride(0),
+        scale_out.stride(1),
+        BLOCK_N=block_n,
+        GROUP_SIZE=group_size,
+        HAS_BF16_OUT=True,
+        HAS_FP8_OUT=True,
+        SCALE_UE8M0=scale_ue8m0,
+        num_warps=_select_num_warps(H),
+    )
+    return bf16_out, fp8_out, scale_out
+
+
+def fused_strided_rmsnorm_per_token_fp8_quant_trigger_preloadb(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    group_size: int = 128,
+    scale_ue8m0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Opt-in PDL producer variant of ``fused_strided_rmsnorm_per_token_fp8_quant``.
+
+    Same outputs as the default wrapper; launches
+    ``_fused_strided_rmsnorm_fp8_kernel_trigger_preloadb`` (early
+    ``gdc_launch_dependents``) with a normal Triton launch.
+    """
+    assert x.dim() == 2
+    assert weight.dim() == 1 and weight.shape[0] == x.shape[1]
+    T, H = x.shape
+    assert H % group_size == 0
+    if scale_ue8m0:
+        assert (H // group_size) % 4 == 0, "UE8M0 requires num_groups divisible by 4"
+
+    block_n = triton.next_power_of_2(H)
+    if block_n > MAX_INREG_H or x.stride(-1) != 1:
+        return _baseline_strided_rmsnorm_fp8_quant(
+            x, weight, eps, group_size, scale_ue8m0
+        )
+
+    fp8_out = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x.device)
+    scale_out = create_per_token_group_quant_fp8_output_scale(
+        x_shape=(T, H),
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=scale_ue8m0,
+    )
+    if T == 0:
+        return fp8_out, scale_out
+
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+    fp8_min = -fp8_max
+    grid = (T,)
+
+    _fused_strided_rmsnorm_fp8_kernel_trigger_preloadb[grid](
+        x,
+        weight,
+        fp8_out,
+        fp8_out,
+        scale_out,
+        H,
+        eps,
+        fp8_max,
+        fp8_min,
+        x.stride(0),
+        fp8_out.stride(0),
+        fp8_out.stride(0),
+        scale_out.stride(0),
+        scale_out.stride(1),
+        BLOCK_N=block_n,
+        GROUP_SIZE=group_size,
+        HAS_BF16_OUT=False,
+        HAS_FP8_OUT=True,
+        SCALE_UE8M0=scale_ue8m0,
+        num_warps=_select_num_warps(H),
+    )
+    return fp8_out, scale_out
+
+
+def fused_strided_rmsnorm_per_token_fp8_quant_with_bf16_output_trigger_preloadb(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    group_size: int = 128,
+    scale_ue8m0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Opt-in PDL producer variant of the dual-output fp8+bf16 fused RMSNorm."""
+    assert x.dim() == 2
+    assert weight.dim() == 1 and weight.shape[0] == x.shape[1]
+    T, H = x.shape
+    assert H % group_size == 0
+    if scale_ue8m0:
+        assert (H // group_size) % 4 == 0, "UE8M0 requires num_groups divisible by 4"
+
+    block_n = triton.next_power_of_2(H)
+    if block_n > MAX_INREG_H or x.stride(-1) != 1:
+        return _baseline_strided_rmsnorm_fp8_quant_with_bf16_output(
+            x, weight, eps, group_size, scale_ue8m0
+        )
+
+    bf16_out = torch.empty((T, H), dtype=torch.bfloat16, device=x.device)
+    fp8_out = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x.device)
+    scale_out = create_per_token_group_quant_fp8_output_scale(
+        x_shape=(T, H),
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=scale_ue8m0,
+    )
+    if T == 0:
+        return bf16_out, fp8_out, scale_out
+
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+    fp8_min = -fp8_max
+    grid = (T,)
+
+    _fused_strided_rmsnorm_fp8_kernel_trigger_preloadb[grid](
         x,
         weight,
         bf16_out,

@@ -145,6 +145,32 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("fuse_silu_and_mul"),
                   py::arg("masked_m"));
 
+    rtp_ops_m.def("per_token_group_quant_fp8_trigger_preloadb",
+                  &per_token_group_quant_fp8_trigger_preloadb,
+                  "Fp8 Gemm Per Token Group (PDL trigger_preloadb producer)",
+                  py::arg("input"),
+                  py::arg("output_q"),
+                  py::arg("output_s"),
+                  py::arg("group_size"),
+                  py::arg("eps"),
+                  py::arg("fp8_min"),
+                  py::arg("fp8_max"),
+                  py::arg("scale_ue8m0"));
+
+    rtp_ops_m.def("per_token_group_quant_fp8_v2_trigger_preloadb",
+                  &per_token_group_quant_fp8_v2_trigger_preloadb,
+                  "Fp8 Gemm Per Token Group v2 (PDL trigger_preloadb producer)",
+                  py::arg("input"),
+                  py::arg("output_q"),
+                  py::arg("output_s"),
+                  py::arg("group_size"),
+                  py::arg("eps"),
+                  py::arg("fp8_min"),
+                  py::arg("fp8_max"),
+                  py::arg("scale_ue8m0"),
+                  py::arg("fuse_silu_and_mul"),
+                  py::arg("masked_m"));
+
     rtp_ops_m.def(
         "embedding", &embedding, "Embedding lookup kernel", py::arg("output"), py::arg("input"), py::arg("weight"));
     rtp_ops_m.def("embedding_bert",

@@ -16,4 +16,17 @@ void sgl_per_token_group_quant_8bit_v2(torch::Tensor                       input
                                        bool                                scale_ue8m0,
                                        bool                                fuse_silu_and_mul,
                                        const std::optional<torch::Tensor>& masked_m);
-}
+
+// Experimental PDL producer variant of sgl_per_token_group_quant_8bit_v2.
+// Normal <<<>>> launch; opt-in for A/B experiments with DeepGEMM preloadb.
+void sgl_per_token_group_quant_8bit_v2_trigger_preloadb(torch::Tensor                       input,
+                                                        torch::Tensor                       output_q,
+                                                        torch::Tensor                       output_s,
+                                                        int64_t                             group_size,
+                                                        double                              eps,
+                                                        double                              min_8bit,
+                                                        double                              max_8bit,
+                                                        bool                                scale_ue8m0,
+                                                        bool                                fuse_silu_and_mul,
+                                                        const std::optional<torch::Tensor>& masked_m);
+}  // namespace rtp_llm

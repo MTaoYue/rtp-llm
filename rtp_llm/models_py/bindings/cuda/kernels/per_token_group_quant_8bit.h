@@ -15,4 +15,17 @@ void per_token_group_quant_8bit(torch::Tensor input,
                                 double        max_8bit,
                                 bool          scale_ue8m0);
 
-}
+// Experimental PDL producer: same as per_token_group_quant_8bit but the
+// kernel calls cudaTriggerProgrammaticLaunchCompletion() at entry so a
+// following DeepGEMM preloadb can start early. Normal <<<>>> launch (no PDL
+// launch attribute). Opt-in via this API for A/B experiments.
+void per_token_group_quant_8bit_trigger_preloadb(torch::Tensor input,
+                                                 torch::Tensor output_q,
+                                                 torch::Tensor output_s,
+                                                 int64_t       group_size,
+                                                 double        eps,
+                                                 double        min_8bit,
+                                                 double        max_8bit,
+                                                 bool          scale_ue8m0);
+
+}  // namespace rtp_llm
