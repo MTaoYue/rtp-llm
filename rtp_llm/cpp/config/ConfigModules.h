@@ -264,11 +264,10 @@ struct HWKernelConfig {
     bool             rocm_disable_custom_ag = true;
     bool             deterministic_gemm     = false;
     bool             deterministic_attn     = false;
-    // Master switch for ALL Triton fuse kernels in the model_py path
-    // (Qwen3.5/Qwen3-Next decoder fuses, GLM5/DSV3.2 MLA fuses,
-    // strided_slice_copy_, _apply_output_bmm, etc.). Set ``false`` to
-    // bypass to the unfused baseline path everywhere — useful for
-    // debugging/verifying precision against the pre-fuse implementation.
+    // Master switch for registered optional fused fast paths in model_py.
+    // Some pre-existing CUDA/cuBLAS fused operations are intentionally
+    // always enabled, so false means fallback for registered paths rather
+    // than a globally unfused process.
     bool        enable_fuse_kernels = true;
     std::string to_string() const;
 };

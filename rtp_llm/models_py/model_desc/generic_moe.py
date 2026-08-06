@@ -26,6 +26,7 @@ from rtp_llm.models_py.modules import (
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
+from rtp_llm.models_py.utils.fuse_config import glm5_prefill_refine_enabled
 from rtp_llm.models_py.modules.factory.linear.fixed_m_linear import fixed_m_linear
 from rtp_llm.models_py.modules.hybrid.glm5_cmp import (
     Glm5Cmp,
@@ -307,6 +308,7 @@ class GenericMoeLayer(nn.Module):
         hidden_states: torch.Tensor,
         x_fp8: "Optional[torch.Tensor]" = None,
         x_scale: "Optional[torch.Tensor]" = None,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
         num_tokens, _ = hidden_states.shape
         if self.gate_chunk_rows > 0 and num_tokens > 0:
@@ -335,7 +337,7 @@ class GenericMoeLayer(nn.Module):
         )
 
         if self.correction_bias is not None:
-            self.group_topk = GroupTopK()
+            self.group_topk = GroupTopK(hw_kernel_config=None)
             self.renormalize = self.config.has_moe_norm
             self.num_expert_group = self.config.moe_n_group
 
@@ -352,6 +354,7 @@ class GenericMoeLayer(nn.Module):
                 topk=self.top_k,
                 renormalize=self.renormalize,
                 routed_scaling_factor=self.routed_scaling_factor,
+                use_fused=is_prefill and glm5_prefill_refine_enabled(),
             )
         else:
             # Top-K selection using C++ SelectTopkOp

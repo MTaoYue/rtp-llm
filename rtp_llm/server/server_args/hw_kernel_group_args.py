@@ -183,10 +183,9 @@ def init_hw_kernel_group_args(parser, hw_kernel_config):
         type=str2bool,
         default=True,
         help=(
-            "model_py 路径下所有 Triton fuse kernel 的总开关 "
-            "(Qwen3.5/Qwen3-Next decoder 融合、GLM5/DSV3.2 MLA 融合、"
-            "strided_slice_copy_、_apply_output_bmm 等)。"
-            "设置为 `False` 时全量回退到 unfused baseline，用于调试或精度对齐验证。"
+            "model_py 已登记可选 fused fast path 的总开关。"
+            "设置为 `False` 时这些路径回到各自 fallback；部分既有 CUDA/cuBLAS "
+            "融合不受该开关控制，因此不表示进程完全 unfused。"
         ),
     )
 
