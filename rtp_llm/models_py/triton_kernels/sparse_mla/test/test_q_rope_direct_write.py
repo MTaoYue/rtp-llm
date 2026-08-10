@@ -202,8 +202,12 @@ class QRoPEDirectWriteCudaTest(unittest.TestCase):
     def test_cuda_graph_capture_and_replay(self) -> None:
         inputs = _make_inputs(17, seed=20260731)
         q, compressed_kv, k_pe, kv_cache, slot_mapping, positions, cache = inputs
-        output = torch.empty(
+        # Direct-write owns only the RoPE suffix. Initialize the BMM prefix
+        # with a finite sentinel so the full-tensor replay check also verifies
+        # that capture/replay does not overwrite memory outside that suffix.
+        output = torch.full(
             (17, HEADS, Q_OUT_DIM),
+            1.0,
             dtype=torch.bfloat16,
             device=q.device,
         )
