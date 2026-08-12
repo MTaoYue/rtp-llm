@@ -1,7 +1,9 @@
 #include "rtp_llm/cpp/disaggregate/cache_store/RequestBlockBufferStore.h"
+#include "rtp_llm/models_py/bindings/NoBlockCopy.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/TimeUtil.h"
+#include <limits>
 #include <torch/torch.h>
 
 namespace rtp_llm {
@@ -28,25 +30,103 @@ bool RequestBlockBufferStore::setRequestBlockBuffer(const std::shared_ptr<Reques
 
     auto                                      blocks = request_block_buffer->getBlocks();
     std::vector<std::shared_ptr<BlockBuffer>> valid_blocks;
-    for (auto iter : blocks) {
+    std::vector<std::shared_ptr<BlockBuffer>> invalid_blocks;
+    valid_blocks.reserve(blocks.size());
+    invalid_blocks.reserve(blocks.size());
+    for (const auto& iter : blocks) {
         auto& block = iter.second;
         if (isValidBlock(block)) {
             valid_blocks.push_back(block);
             continue;
         }
 
-        auto valid_block = makeValidBlock(block);
-        if (!valid_block) {
-            RTP_LLM_LOG_WARNING("set request block buffer failed to make valid block, request id %s",
+        invalid_blocks.push_back(block);
+    }
+
+    if (!invalid_blocks.empty() && !memory_util_->isRdmaMode()) {
+        if (!makeValidBlocksForTcp(invalid_blocks, valid_blocks)) {
+            RTP_LLM_LOG_WARNING("set request block buffer failed to stage tcp blocks, request id %s",
                                 request_block_buffer->getRequestId().c_str());
             return false;
         }
-        valid_blocks.push_back(valid_block);
-        RTP_LLM_LOG_DEBUG("set request block buffer success to make valid block, request id %s, block id is %s",
-                          request_block_buffer->getRequestId().c_str(),
-                          block->key.c_str());
+    } else {
+        for (const auto& block : invalid_blocks) {
+            auto valid_block = makeValidBlock(block);
+            if (!valid_block) {
+                RTP_LLM_LOG_WARNING("set request block buffer failed to make valid block, request id %s",
+                                    request_block_buffer->getRequestId().c_str());
+                return false;
+            }
+            valid_blocks.push_back(valid_block);
+            RTP_LLM_LOG_DEBUG("set request block buffer success to make valid block, request id %s, block id is %s",
+                              request_block_buffer->getRequestId().c_str(),
+                              block->key.c_str());
+        }
     }
     store_request_block_buffer->addBlocks(valid_blocks);
+    return true;
+}
+
+bool RequestBlockBufferStore::makeValidBlocksForTcp(
+    const std::vector<std::shared_ptr<BlockBuffer>>& blocks,
+    std::vector<std::shared_ptr<BlockBuffer>>&       valid_blocks) {
+    if (!isRuntimeInitialized()) {
+        RTP_LLM_LOG_WARNING("make valid tcp blocks failed, runtime is not initialized");
+        return false;
+    }
+
+    size_t total_bytes = 0;
+    for (const auto& block : blocks) {
+        if (block->len > std::numeric_limits<size_t>::max() - total_bytes) {
+            RTP_LLM_LOG_WARNING("make valid tcp blocks failed, total size overflow");
+            return false;
+        }
+        total_bytes += block->len;
+    }
+    if (total_bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        RTP_LLM_LOG_WARNING("make valid tcp blocks failed, total size %zu exceeds tensor limit", total_bytes);
+        return false;
+    }
+
+    auto backing = std::make_shared<torch::Tensor>(
+        torch::empty({static_cast<int64_t>(total_bytes)},
+                     torch::TensorOptions().dtype(torch::kUInt8).pinned_memory(true)));
+    if (!backing->defined()) {
+        RTP_LLM_LOG_WARNING("make valid tcp blocks failed, alloc %zu bytes failed", total_bytes);
+        return false;
+    }
+
+    auto* base = static_cast<uint8_t*>(backing->data_ptr());
+    if (!memory_util_->isMemoryMr(base, total_bytes, false, false)
+        && !memory_util_->regUserMr(base, total_bytes, false)) {
+        RTP_LLM_LOG_WARNING("make valid tcp blocks failed to register %zu bytes", total_bytes);
+        return false;
+    }
+
+    MultiCopyParams copy_params;
+    copy_params.multi_dst.reserve(blocks.size());
+    copy_params.multi_src.reserve(blocks.size());
+
+    size_t offset = 0;
+    for (const auto& block : blocks) {
+        auto*                 dst_ptr = base + offset;
+        std::shared_ptr<void> addr(backing, dst_ptr);
+        valid_blocks.push_back(std::make_shared<BlockBuffer>(block->key, addr, block->len, false, true));
+        copy_params.multi_dst.push_back(torch::from_blob(
+            dst_ptr, {static_cast<int64_t>(block->len)}, torch::TensorOptions().dtype(torch::kUInt8)));
+        copy_params.multi_src.push_back(torch::from_blob(
+            block->addr.get(),
+            {static_cast<int64_t>(block->len)},
+            torch::TensorOptions().dtype(torch::kUInt8).device(block->gpu_mem ? torch::kCUDA : torch::kCPU)));
+        offset += block->len;
+    }
+
+    RTP_LLM_INTERVAL_LOG(120,
+                         INFO,
+                         "stage tcp block cache in batch, blocks=%zu bytes=%zu",
+                         blocks.size(),
+                         total_bytes);
+    execNoBlockCopy(copy_params);
     return true;
 }
 

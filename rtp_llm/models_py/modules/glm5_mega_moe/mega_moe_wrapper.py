@@ -198,6 +198,9 @@ class MegaMoeWrapper(nn.Module):
                 "weights with checkpoint scales. "
                 f"Got moe_w1 dtype={w1.dtype}, moe_w2 dtype={w2.dtype}."
             )
+        # Layout transforms enqueue multi-GiB copies. Wait for them before
+        # releasing inputs so the next layer cannot accumulate pending blocks.
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
         self.expert_num = n_routed_experts

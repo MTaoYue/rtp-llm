@@ -7,6 +7,9 @@
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "autil/EnvUtil.h"
 
+#include <algorithm>
+#include <limits>
+
 namespace rtp_llm {
 
 class RequestBlockBufferStoreTest: public CacheStoreTestBase {};
@@ -49,6 +52,34 @@ TEST_F(RequestBlockBufferStoreTest, testBlocksOps) {
     ASSERT_FALSE(store->debugInfoOnRequest("request-1").empty());
 
     store->delRequestBlockBuffer("request-2");
+}
+
+TEST_F(RequestBlockBufferStoreTest, testBatchGpuBlocksForTcp) {
+    constexpr size_t   block_count = 256;
+    constexpr uint32_t block_size  = 4096;
+
+    auto request_block = std::make_shared<RequestBlockBuffer>("request-batch");
+    for (size_t i = 0; i < block_count; ++i) {
+        request_block->addBlock(block_buffer_util_->makeBlockBuffer(
+            "block-" + std::to_string(i), block_size, static_cast<char>(i % 127), true));
+    }
+
+    auto store = std::make_shared<RequestBlockBufferStore>(memory_util_);
+    ASSERT_TRUE(store->setRequestBlockBuffer(request_block));
+
+    uintptr_t min_addr = std::numeric_limits<uintptr_t>::max();
+    uintptr_t max_addr = 0;
+    for (size_t i = 0; i < block_count; ++i) {
+        auto block = store->getBlockBuffer("request-batch", "block-" + std::to_string(i));
+        ASSERT_NE(block, nullptr);
+        ASSERT_FALSE(block->gpu_mem);
+        auto* copied = static_cast<uint8_t*>(block->addr.get());
+        EXPECT_EQ(copied[0], static_cast<uint8_t>(i % 127));
+        EXPECT_EQ(copied[block_size - 1], static_cast<uint8_t>(i % 127));
+        min_addr = std::min(min_addr, reinterpret_cast<uintptr_t>(copied));
+        max_addr = std::max(max_addr, reinterpret_cast<uintptr_t>(copied) + block->len);
+    }
+    EXPECT_EQ(max_addr - min_addr, block_count * block_size);
 }
 
 TEST_F(RequestBlockBufferStoreTest, testWatchFunc_SetBeforeBlocks) {
