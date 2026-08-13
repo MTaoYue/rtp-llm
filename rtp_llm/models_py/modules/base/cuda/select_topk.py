@@ -109,9 +109,14 @@ class GroupTopK(nn.Module):
         n_group: int,
         topk_group: int,
         topk: int,
+        use_fused: Optional[bool] = None,
     ) -> bool:
         """Whether the strict fused op can consume these BF16 logits."""
-        return self.use_fused and self._fused_supported(
+        if use_fused is None:
+            use_fused = self.use_fused
+        else:
+            use_fused = self.use_fused and use_fused
+        return use_fused and self._fused_supported(
             topk_weights,
             topk_ids,
             scores,
@@ -190,6 +195,7 @@ class GroupTopK(nn.Module):
             n_group,
             topk_group,
             topk,
+            use_fused=use_fused,
         ):
             self.forward_fused(*args)
         else:

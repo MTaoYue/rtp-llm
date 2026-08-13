@@ -224,6 +224,31 @@ class GroupTopKTest(TestCase):
             group_topk.can_use_fused(
                 values,
                 indices,
+                bf16_logits,
+                correction_bias,
+                self.NUM_GROUPS,
+                self.TOPK_GROUP,
+                self.TOPK,
+                use_fused=False,
+            )
+        )
+        disabled_group_topk = GroupTopK(use_fused=False)
+        self.assertFalse(
+            disabled_group_topk.can_use_fused(
+                values,
+                indices,
+                bf16_logits,
+                correction_bias,
+                self.NUM_GROUPS,
+                self.TOPK_GROUP,
+                self.TOPK,
+                use_fused=True,
+            )
+        )
+        self.assertFalse(
+            group_topk.can_use_fused(
+                values,
+                indices,
                 fp32_logits,
                 correction_bias,
                 self.NUM_GROUPS,

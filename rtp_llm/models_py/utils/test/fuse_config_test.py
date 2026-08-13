@@ -10,12 +10,12 @@ from rtp_llm.models_py.utils.fuse_config import (
 
 
 class FuseConfigTest(TestCase):
-    def test_defaults_enable_master_and_refine_paths(self) -> None:
+    def test_defaults_enable_master_and_disable_refine_paths(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ENABLE_FUSE_KERNELS", None)
             os.environ.pop("RTP_LLM_GLM5_PREFILL_REFINE", None)
             self.assertTrue(fuse_kernels_enabled())
-            self.assertTrue(glm5_prefill_refine_enabled())
+            self.assertFalse(glm5_prefill_refine_enabled())
 
     def test_refine_switch_preserves_master_switch(self) -> None:
         with patch.dict(

@@ -6,9 +6,9 @@ Master switch lives on ``HWKernelConfig.enable_fuse_kernels`` (default
 fast paths to their fallbacks. Some pre-existing CUDA/cuBLAS fused
 operations remain enabled and are outside this switch.
 
-``RTP_LLM_GLM5_PREFILL_REFINE`` (default ``True``) is a nested ablation
-switch for the GLM5 prefill refinements added together. Keep the master
-switch enabled and toggle only this switch for a same-binary strict A/B.
+``RTP_LLM_GLM5_PREFILL_REFINE`` (default ``False``) is an opt-in switch
+for the GLM5 prefill refinements added together. Keep the master switch
+enabled and set this switch explicitly for a same-binary strict A/B.
 
 Covered fuse paths:
   - Qwen3.5 / Qwen3-Next decoder layer fuses
@@ -69,14 +69,15 @@ def glm5_prefill_refine_enabled(hw_kernel_config: Optional[Any] = None) -> bool:
     """Return whether the GLM5 prefill refinement group should run.
 
     The refinement gate is nested under ``ENABLE_FUSE_KERNELS``. With the
-    master switch enabled, set ``RTP_LLM_GLM5_PREFILL_REFINE=0`` to recover
-    the pre-refinement production paths in the same binary while preserving
-    previously existing fused kernels. The gate is process-wide; for a PD
-    prefill A/B, change it only in the prefill role and keep decode fixed.
+    master switch enabled, only explicit truthy values for
+    ``RTP_LLM_GLM5_PREFILL_REFINE`` enable the refinements. When unset or
+    false, the pre-refinement production paths run while preserving previously
+    existing fused kernels. The gate is process-wide; for a PD prefill A/B,
+    change it only in the prefill role and keep decode fixed.
     """
     if not fuse_kernels_enabled(hw_kernel_config):
         return False
     val = os.environ.get("RTP_LLM_GLM5_PREFILL_REFINE")
     if val is None:
-        return True
+        return False
     return val.lower() in ("1", "true", "yes", "on")
