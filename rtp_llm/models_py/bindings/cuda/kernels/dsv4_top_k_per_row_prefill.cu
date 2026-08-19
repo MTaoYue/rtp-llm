@@ -32,7 +32,8 @@ void dsv4_top_k_per_row_prefill_impl(const torch::Tensor& logits,
     TORCH_CHECK(row_starts.is_cuda(), "row_starts must be CUDA tensor");
     TORCH_CHECK(row_ends.is_cuda(), "row_ends must be CUDA tensor");
     TORCH_CHECK(indices_out.is_cuda(), "indices_out must be CUDA tensor");
-    TORCH_CHECK(logits.dtype() == torch::kFloat32, "logits must be float32");
+    TORCH_CHECK(logits.dtype() == torch::kFloat32 || logits.dtype() == torch::kBFloat16,
+                "logits must be float32 or bfloat16");
     TORCH_CHECK(row_starts.dtype() == torch::kInt32, "row_starts must be int32");
     TORCH_CHECK(row_ends.dtype() == torch::kInt32, "row_ends must be int32");
     TORCH_CHECK(indices_out.dtype() == torch::kInt32, "indices_out must be int32");
@@ -48,34 +49,37 @@ void dsv4_top_k_per_row_prefill_impl(const torch::Tensor& logits,
     const cudaStream_t stream                     = at::cuda::getCurrentCUDAStream();
 
     int numInsertionBlocks = force_radix_sort ? 0 : std::min(static_cast<int>(num_rows), kSortingAlgorithmThreshold);
-    if (numInsertionBlocks > 0) {
-        vllm::dsv4_prefill::topKPerRowPrefill<kNumThreadsPerBlock, false>
-            <<<numInsertionBlocks, kNumThreadsPerBlock, static_cast<size_t>(top_k) * sizeof(int32_t), stream>>>(
-                logits.data_ptr<float>(),
-                row_starts.data_ptr<int>(),
-                row_ends.data_ptr<int>(),
-                nullptr,
-                indices_out.data_ptr<int>(),
-                static_cast<int>(stride0),
-                static_cast<int>(stride1),
-                static_cast<int>(top_k),
-                0);
-    }
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        torch::kBFloat16, torch::kHalf, logits.scalar_type(), "dsv4_top_k_per_row_prefill", [&] {
+            if (numInsertionBlocks > 0) {
+                vllm::dsv4_prefill::topKPerRowPrefill<scalar_t, kNumThreadsPerBlock, false>
+                    <<<numInsertionBlocks, kNumThreadsPerBlock, static_cast<size_t>(top_k) * sizeof(int32_t), stream>>>(
+                        logits.data_ptr<scalar_t>(),
+                        row_starts.data_ptr<int>(),
+                        row_ends.data_ptr<int>(),
+                        nullptr,
+                        indices_out.data_ptr<int>(),
+                        static_cast<int>(stride0),
+                        static_cast<int>(stride1),
+                        static_cast<int>(top_k),
+                        0);
+            }
 
-    if (numInsertionBlocks < num_rows) {
-        int numRadixBlocks = static_cast<int>(num_rows) - numInsertionBlocks;
-        vllm::dsv4_prefill::topKPerRowPrefill<kNumThreadsPerBlock, true>
-            <<<numRadixBlocks, kNumThreadsPerBlock, static_cast<size_t>(top_k) * sizeof(int32_t), stream>>>(
-                logits.data_ptr<float>(),
-                row_starts.data_ptr<int>(),
-                row_ends.data_ptr<int>(),
-                nullptr,
-                indices_out.data_ptr<int>(),
-                static_cast<int>(stride0),
-                static_cast<int>(stride1),
-                static_cast<int>(top_k),
-                numInsertionBlocks);
-    }
+            if (numInsertionBlocks < num_rows) {
+                int numRadixBlocks = static_cast<int>(num_rows) - numInsertionBlocks;
+                vllm::dsv4_prefill::topKPerRowPrefill<scalar_t, kNumThreadsPerBlock, true>
+                    <<<numRadixBlocks, kNumThreadsPerBlock, static_cast<size_t>(top_k) * sizeof(int32_t), stream>>>(
+                        logits.data_ptr<scalar_t>(),
+                        row_starts.data_ptr<int>(),
+                        row_ends.data_ptr<int>(),
+                        nullptr,
+                        indices_out.data_ptr<int>(),
+                        static_cast<int>(stride0),
+                        static_cast<int>(stride1),
+                        static_cast<int>(top_k),
+                        numInsertionBlocks);
+            }
+        });
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "dsv4_top_k_per_row_prefill launch failed: ", cudaGetErrorString(err));

@@ -9,6 +9,7 @@ from torch import nn
 
 from rtp_llm.models_py.distributed.collective_torch import Group, barrier
 from rtp_llm.models_py.distributed.pynccl_cp import all_gather
+from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import fp8_fp4_mqa_logits
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import sgl_per_token_group_quant_fp8
 from rtp_llm.models_py.modules.dsv4.chunk_env import dsv4_chunk_tokens_from_env
 from rtp_llm.ops.compute_ops import KVCache, rtp_llm_ops
@@ -64,6 +65,16 @@ def _fp8_prefill_topk_canonicalize() -> bool:
         "yes",
         "on",
     )
+
+
+def _glm5_prefill_mqa_logits_mode() -> str:
+    mode = os.environ.get("GLM5_PREFILL_MQA_LOGITS_MODE", "fp32").strip().lower()
+    valid = ("fp32", "fp32_epilogue_bf16_store", "bf16_epilogue_bf16_store")
+    if mode not in valid:
+        raise ValueError(
+            "GLM5_PREFILL_MQA_LOGITS_MODE must be one of " f"{valid}, got {mode!r}"
+        )
+    return mode
 
 
 def _canonicalize_topk_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -239,9 +250,11 @@ class IndexerOp(nn.Module):
         self.scale_fmt = scale_fmt
         self.is_neox_style = is_neox_style
 
-        glm5_topk_backend = os.environ.get(
-            "GLM5_INDEXER_TOPK_BACKEND", "dsv4_persistent"
-        ).strip().lower()
+        glm5_topk_backend = (
+            os.environ.get("GLM5_INDEXER_TOPK_BACKEND", "dsv4_persistent")
+            .strip()
+            .lower()
+        )
         if glm5_topk_backend not in ("dsv4_persistent", "topk_v3"):
             raise ValueError(
                 "GLM5_INDEXER_TOPK_BACKEND must be 'dsv4_persistent' or "
@@ -253,9 +266,11 @@ class IndexerOp(nn.Module):
             else rtp_llm_ops.dsv4_persistent_topk
         )
 
-        prefill_topk_backend = os.environ.get(
-            "GLM5_PREFILL_INDEXER_TOPK_BACKEND", "dsv4_per_row"
-        ).strip().lower()
+        prefill_topk_backend = (
+            os.environ.get("GLM5_PREFILL_INDEXER_TOPK_BACKEND", "dsv4_per_row")
+            .strip()
+            .lower()
+        )
         if prefill_topk_backend not in ("topk_v3_tie_break", "dsv4_per_row"):
             raise ValueError(
                 "GLM5_PREFILL_INDEXER_TOPK_BACKEND must be "
@@ -263,6 +278,40 @@ class IndexerOp(nn.Module):
                 f"got {prefill_topk_backend!r}"
             )
         self._prefill_topk_backend = prefill_topk_backend
+        self._prefill_mqa_logits_mode = _glm5_prefill_mqa_logits_mode()
+
+    def _prefill_mqa_logits(
+        self,
+        q: torch.Tensor,
+        kv: Tuple[torch.Tensor, torch.Tensor],
+        weights: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._prefill_mqa_logits_mode == "fp32":
+            return deep_gemm.fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False)
+
+        epilogue_weights = weights.contiguous()
+        if self._prefill_mqa_logits_mode == "bf16_epilogue_bf16_store":
+            epilogue_weights = epilogue_weights.to(torch.bfloat16)
+        else:
+            epilogue_weights = epilogue_weights.to(torch.float32)
+        logits = fp8_fp4_mqa_logits(
+            (q.contiguous(), None),
+            (kv[0].contiguous(), kv[1].contiguous()),
+            epilogue_weights,
+            ks,
+            ke,
+            clean_logits=False,
+            max_seqlen_k=0,
+            logits_dtype=torch.bfloat16,
+        )
+        if logits.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "GLM5_PREFILL_MQA_LOGITS_MODE requested BF16 logits, "
+                f"but DeepGEMM returned {logits.dtype}"
+            )
+        return logits
 
     def _run_prefill_topk(
         self,
@@ -272,6 +321,15 @@ class IndexerOp(nn.Module):
         output: torch.Tensor,
         max_seq_len: int,
     ) -> None:
+        expected_dtype = (
+            torch.float32 if self._prefill_mqa_logits_mode == "fp32" else torch.bfloat16
+        )
+        if logits.dtype != expected_dtype:
+            raise RuntimeError(
+                "GLM5 prefill TopK input dtype does not match "
+                f"GLM5_PREFILL_MQA_LOGITS_MODE={self._prefill_mqa_logits_mode!r}: "
+                f"expected {expected_dtype}, got {logits.dtype}"
+            )
         if self._prefill_topk_backend == "topk_v3_tie_break":
             rtp_llm_ops.topk_v3_tie_break(
                 logits,
@@ -872,13 +930,12 @@ class IndexerOp(nn.Module):
         row_start = 0
         while row_start < num_rows:
             row_end = min(row_start + chunk_rows, num_rows)
-            logits = deep_gemm.fp8_mqa_logits(
+            logits = self._prefill_mqa_logits(
                 q_fp8[row_start:row_end],
                 kv_fp8,
                 weights[row_start:row_end],
                 fmha_params.ks[row_start:row_end],
                 fmha_params.ke[row_start:row_end],
-                clean_logits=False,
             )
             topk_part = logits.new_empty(
                 (logits.shape[0], self.index_topk), dtype=torch.int32
@@ -1069,13 +1126,12 @@ class IndexerOp(nn.Module):
             row_start = 0
             while row_start < nr:
                 row_end = min(row_start + chunk_rows, nr)
-                logits_p = deep_gemm.fp8_mqa_logits(
+                logits_p = self._prefill_mqa_logits(
                     q_part[row_start:row_end],
                     kv_fp8_full,
                     weights_part[row_start:row_end],
                     ks[row_start:row_end],
                     ke[row_start:row_end],
-                    clean_logits=False,
                 )
                 topk_part = logits_p.new_empty(
                     (logits_p.shape[0], self.index_topk), dtype=torch.int32

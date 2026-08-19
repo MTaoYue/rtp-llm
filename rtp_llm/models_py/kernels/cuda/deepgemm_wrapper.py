@@ -19,6 +19,7 @@ __all__ = [
     "m_grouped_fp8_fp4_gemm_nt_contiguous",
     "m_grouped_fp8_fp4_gemm_nt_masked",
     "fp8_fp4_paged_mqa_logits",
+    "fp8_fp4_mqa_logits",
     "per_token_cast_to_fp4",
     "cast_back_from_fp4",
     "transpose_packed_fp4",
@@ -40,6 +41,7 @@ _deep_gemm_impl_new_map = {
     "m_grouped_fp8_fp4_gemm_nt_contiguous": "m_grouped_fp8_fp4_gemm_nt_contiguous",
     "m_grouped_fp8_fp4_gemm_nt_masked": "m_grouped_fp8_fp4_gemm_nt_masked",
     "fp8_fp4_paged_mqa_logits": "fp8_fp4_paged_mqa_logits",
+    "fp8_fp4_mqa_logits": "fp8_fp4_mqa_logits",
     "per_token_cast_to_fp4": "per_token_cast_to_fp4",
     "cast_back_from_fp4": "cast_back_from_fp4",
     "transpose_packed_fp4": "transpose_packed_fp4",
@@ -57,6 +59,7 @@ _deep_gemm_impl_old_map = {
     "m_grouped_fp8_fp4_gemm_nt_contiguous": "m_grouped_fp8_fp4_gemm_nt_contiguous",
     "m_grouped_fp8_fp4_gemm_nt_masked": "m_grouped_fp8_fp4_gemm_nt_masked",
     "fp8_fp4_paged_mqa_logits": "fp8_fp4_paged_mqa_logits",
+    "fp8_fp4_mqa_logits": "fp8_fp4_mqa_logits",
     "per_token_cast_to_fp4": "per_token_cast_to_fp4",
     "cast_back_from_fp4": "cast_back_from_fp4",
     "transpose_packed_fp4": "transpose_packed_fp4",
@@ -74,6 +77,7 @@ _fp8_fp4_gemm_nt_impl: Callable[..., Any] | None = None
 _m_grouped_fp8_fp4_gemm_nt_contiguous_impl: Callable[..., Any] | None = None
 _m_grouped_fp8_fp4_gemm_nt_masked_impl: Callable[..., Any] | None = None
 _fp8_fp4_paged_mqa_logits_impl: Callable[..., Any] | None = None
+_fp8_fp4_mqa_logits_impl: Callable[..., Any] | None = None
 _per_token_cast_to_fp4_impl: Callable[..., Any] | None = None
 _cast_back_from_fp4_impl: Callable[..., Any] | None = None
 _transpose_packed_fp4_impl: Callable[..., Any] | None = None
@@ -123,7 +127,7 @@ def _lazy_init_deep_gemm(symbols: List[str]) -> None:
     global _fp8_gemm_nt_impl, _m_grouped_fp8_gemm_nt_contiguous_impl, _m_grouped_fp8_gemm_nt_masked_impl
     global _bf16_gemm_nt_impl, _m_grouped_bf16_gemm_nt_contiguous_impl, _m_grouped_bf16_gemm_nt_masked_impl
     global _fp8_fp4_gemm_nt_impl, _m_grouped_fp8_fp4_gemm_nt_contiguous_impl, _m_grouped_fp8_fp4_gemm_nt_masked_impl
-    global _fp8_fp4_paged_mqa_logits_impl, _per_token_cast_to_fp4_impl
+    global _fp8_fp4_paged_mqa_logits_impl, _fp8_fp4_mqa_logits_impl, _per_token_cast_to_fp4_impl
     global _cast_back_from_fp4_impl, _transpose_packed_fp4_impl
     global _tf32_hc_prenorm_gemm_impl
 
@@ -796,6 +800,34 @@ def fp8_fp4_paged_mqa_logits(
         schedule_meta,
         max_context_len,
         clean_logits,
+        logits_dtype,
+    )
+
+
+def fp8_fp4_mqa_logits(
+    q: Tuple[torch.Tensor, Optional[torch.Tensor]],
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seq_len_k_start: torch.Tensor,
+    cu_seq_len_k_end: torch.Tensor,
+    clean_logits: bool = False,
+    max_seqlen_k: int = 0,
+    logits_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """FP8-query/FP8-KV ragged MQA logits with selectable output dtype."""
+    global _fp8_fp4_mqa_logits_impl
+    if _fp8_fp4_mqa_logits_impl is None:
+        _lazy_init_deep_gemm(["fp8_fp4_mqa_logits"])
+    if _fp8_fp4_mqa_logits_impl is None:
+        return _missing_deep_gemm()
+    return _fp8_fp4_mqa_logits_impl(
+        q,
+        kv,
+        weights,
+        cu_seq_len_k_start,
+        cu_seq_len_k_end,
+        clean_logits,
+        max_seqlen_k,
         logits_dtype,
     )
 

@@ -17,6 +17,7 @@ from rtp_llm.models_py.modules.base.cuda.indexer_op import (
     _canonicalize_topk_indices,
     _fp8_prefill_topk_canonicalize,
     _fp8_prefill_topk_force_radix_sort,
+    _glm5_prefill_mqa_logits_mode,
 )
 from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_mha.cp_utils import (
     generate_q_indices,
@@ -77,6 +78,24 @@ class GetTopkRaggedCPZeroLocalTest(TestCase):
         with patch.dict("os.environ", {}, clear=True):
             op = self._make_indexer_op()
         self.assertEqual(op._prefill_topk_backend, "dsv4_per_row")
+
+    def test_glm5_prefill_mqa_logits_mode_defaults_to_fp32(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(_glm5_prefill_mqa_logits_mode(), "fp32")
+
+    def test_glm5_prefill_mqa_logits_mode_supports_bf16_variants(self):
+        for mode in ("fp32_epilogue_bf16_store", "bf16_epilogue_bf16_store"):
+            with patch.dict(
+                "os.environ", {"GLM5_PREFILL_MQA_LOGITS_MODE": mode}, clear=True
+            ):
+                self.assertEqual(_glm5_prefill_mqa_logits_mode(), mode)
+
+    def test_glm5_prefill_mqa_logits_mode_rejects_invalid_value(self):
+        with patch.dict(
+            "os.environ", {"GLM5_PREFILL_MQA_LOGITS_MODE": "bf16"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "GLM5_PREFILL_MQA_LOGITS_MODE"):
+                _glm5_prefill_mqa_logits_mode()
 
     def test_glm5_prefill_topk_backend_enables_stable_v3_explicitly(self):
         with patch.dict(
@@ -146,6 +165,75 @@ class GetTopkRaggedCPZeroLocalTest(TestCase):
         )
         legacy_per_row.assert_not_called()
 
+    def test_glm5_bf16_mqa_modes_pass_bf16_scores_to_per_row_topk(self):
+        for mode in ("fp32_epilogue_bf16_store", "bf16_epilogue_bf16_store"):
+            with patch.dict(
+                "os.environ",
+                {
+                    "GLM5_PREFILL_MQA_LOGITS_MODE": mode,
+                    "GLM5_PREFILL_INDEXER_TOPK_BACKEND": "dsv4_per_row",
+                },
+                clear=True,
+            ):
+                op = self._make_indexer_op()
+                scores = torch.empty((2, 8), dtype=torch.bfloat16)
+                row_starts = torch.tensor([0, 1], dtype=torch.int32)
+                row_ends = torch.tensor([8, 7], dtype=torch.int32)
+                output = torch.empty((2, 512), dtype=torch.int32)
+                with patch.object(rtp_llm_ops, "dsv4_top_k_per_row_prefill") as per_row:
+                    op._run_prefill_topk(
+                        scores, row_starts, row_ends, output, max_seq_len=8
+                    )
+                self.assertIs(per_row.call_args.args[0], scores)
+                self.assertEqual(per_row.call_args.args[0].dtype, torch.bfloat16)
+
+    def test_glm5_bf16_mqa_modes_pass_bf16_scores_to_tie_break_topk(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "GLM5_PREFILL_MQA_LOGITS_MODE": "bf16_epilogue_bf16_store",
+                "GLM5_PREFILL_INDEXER_TOPK_BACKEND": "topk_v3_tie_break",
+            },
+            clear=True,
+        ):
+            op = self._make_indexer_op()
+            scores = torch.empty((2, 8), dtype=torch.bfloat16)
+            row_starts = torch.tensor([0, 1], dtype=torch.int32)
+            row_ends = torch.tensor([8, 7], dtype=torch.int32)
+            output = torch.empty((2, 512), dtype=torch.int32)
+            with patch.object(rtp_llm_ops, "topk_v3_tie_break") as tie_break:
+                op._run_prefill_topk(
+                    scores, row_starts, row_ends, output, max_seq_len=8
+                )
+            self.assertIs(tie_break.call_args.args[0], scores)
+            self.assertEqual(tie_break.call_args.args[0].dtype, torch.bfloat16)
+
+    def test_glm5_bf16_mqa_modes_select_expected_deepgemm_weight_dtype(self):
+        q = torch.empty((2, 128), dtype=torch.uint8)
+        k = torch.empty((8, 128), dtype=torch.uint8)
+        scale = torch.ones((8, 1), dtype=torch.float32)
+        weights = torch.ones((2, 128), dtype=torch.float32)
+        ks = torch.tensor([0, 0], dtype=torch.int32)
+        ke = torch.tensor([8, 8], dtype=torch.int32)
+
+        for mode, expected_dtype in (
+            ("fp32_epilogue_bf16_store", torch.float32),
+            ("bf16_epilogue_bf16_store", torch.bfloat16),
+        ):
+            with patch.dict(
+                "os.environ", {"GLM5_PREFILL_MQA_LOGITS_MODE": mode}, clear=True
+            ):
+                op = self._make_indexer_op()
+                with patch(
+                    "rtp_llm.models_py.modules.base.cuda.indexer_op.fp8_fp4_mqa_logits",
+                    return_value=torch.empty((2, 8), dtype=torch.bfloat16),
+                ) as mqa:
+                    logits = op._prefill_mqa_logits(q, (k, scale), weights, ks, ke)
+                self.assertEqual(logits.dtype, torch.bfloat16)
+                self.assertEqual(mqa.call_args.args[2].dtype, expected_dtype)
+                self.assertEqual(mqa.call_args.kwargs["logits_dtype"], torch.bfloat16)
+                self.assertFalse(mqa.call_args.kwargs["clean_logits"])
+
     def test_glm5_prefill_topk_backend_rejects_invalid_value(self):
         with patch.dict(
             "os.environ",
@@ -158,13 +246,9 @@ class GetTopkRaggedCPZeroLocalTest(TestCase):
                 self._make_indexer_op()
 
     def test_prefill_topk_canonicalization_switch(self):
-        with patch.dict(
-            "os.environ", {"DSV4_INDEXER_TOPK_CANONICALIZE": "1"}
-        ):
+        with patch.dict("os.environ", {"DSV4_INDEXER_TOPK_CANONICALIZE": "1"}):
             self.assertTrue(_fp8_prefill_topk_canonicalize())
-        with patch.dict(
-            "os.environ", {"DSV4_INDEXER_TOPK_CANONICALIZE": "0"}
-        ):
+        with patch.dict("os.environ", {"DSV4_INDEXER_TOPK_CANONICALIZE": "0"}):
             self.assertFalse(_fp8_prefill_topk_canonicalize())
 
     def test_prefill_topk_policy_is_chunk_invariant(self):
@@ -180,9 +264,7 @@ class GetTopkRaggedCPZeroLocalTest(TestCase):
             self.assertTrue(_fp8_prefill_topk_force_radix_sort())
             got = _canonicalize_topk_indices(indices)
 
-        expected = torch.tensor(
-            [[3, 5, 7, -1], [2, 4, 9, -1]], dtype=torch.int32
-        )
+        expected = torch.tensor([[3, 5, 7, -1], [2, 4, 9, -1]], dtype=torch.int32)
         torch.testing.assert_close(got, expected, atol=0, rtol=0)
 
     def test_zero_local_ids_returns_empty_tensor(self):

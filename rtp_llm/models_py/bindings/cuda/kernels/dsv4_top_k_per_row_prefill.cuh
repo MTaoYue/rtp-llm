@@ -10,6 +10,7 @@
 #define DSV4_TOP_K_PER_ROW_PREFILL_CUH_
 
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
@@ -114,7 +115,8 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, const
     }
 }
 
-template<int  step,
+template<typename LogitT,
+         int  step,
          int  kNumThreadsPerBlock,
          int  kNumBins,
          int  kNumFinalItems,
@@ -123,7 +125,7 @@ template<int  step,
          typename SmemFinalType,
          typename SmemOutputType>
 __device__ bool processHistogramStep(const int*      indices,
-                                     const float*    logits,
+                                     const LogitT*   logits,
                                      int             rowEnd,
                                      uint32_t&       logitPattern,
                                      int&            thresholdBinIdx,
@@ -279,18 +281,19 @@ template<int  kNumThreadsPerBlock,
          int  kNumBins,
          bool useRadixSort,
          bool multipleBlocksPerRow = false,
-         bool mergeBlocks          = false>
-static __device__ void topKPerRowJob(const int*   indices,
-                                     const float* logits,
-                                     int          rowStart,
-                                     int          rowEnd,
-                                     int*         outIndices,
-                                     float*       outLogits,
-                                     int          stride1,
-                                     int          topK) {
+         bool mergeBlocks          = false,
+         typename LogitT           = float>
+static __device__ void topKPerRowJob(const int*    indices,
+                                     const LogitT* logits,
+                                     int           rowStart,
+                                     int           rowEnd,
+                                     int*          outIndices,
+                                     float*        outLogits,
+                                     int           stride1,
+                                     int           topK) {
     static constexpr int kNumFinalItems          = 2048;
     static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
-    using FinalSort = cub::BlockRadixSort<uint64_t, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
+    using FinalSort            = cub::BlockRadixSort<uint64_t, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
     using FinalSortTempStorage = std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
     using Scan                 = cub::BlockScan<int, kNumThreadsPerBlock>;
 
@@ -322,7 +325,7 @@ static __device__ void topKPerRowJob(const int*   indices,
         for (int rowIt = threadIdx.x; rowIt < rowLen; rowIt += kNumThreadsPerBlock) {
             if constexpr (multipleBlocksPerRow) {
                 outIndices[rowIt] = rowIt + rowStart;
-                outLogits[rowIt]  = logits[rowIt + rowStart];
+                outLogits[rowIt]  = static_cast<float>(logits[rowIt + rowStart]);
             } else {
                 outIndices[rowIt] = rowIt;
             }
@@ -344,75 +347,92 @@ static __device__ void topKPerRowJob(const int*   indices,
     int      thresholdBinIdx = -1;
     uint32_t logitPattern    = 0;
 
-    bool continueToNextStep =
-        processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-            indices,
-            logits,
-            rowEnd,
-            logitPattern,
-            thresholdBinIdx,
-            smemOutput,
-            smemThresholdBinIdx,
-            smemFinalDstIdx,
-            smemFinalBinSize,
-            smemFoundTopKValues,
-            smemFinal,
-            stride1,
-            rowStart,
-            topK);
+    bool continueToNextStep = processHistogramStep<LogitT,
+                                                   0,
+                                                   kNumThreadsPerBlock,
+                                                   kNumBins,
+                                                   kNumFinalItems,
+                                                   multipleBlocksPerRow,
+                                                   mergeBlocks>(indices,
+                                                                logits,
+                                                                rowEnd,
+                                                                logitPattern,
+                                                                thresholdBinIdx,
+                                                                smemOutput,
+                                                                smemThresholdBinIdx,
+                                                                smemFinalDstIdx,
+                                                                smemFinalBinSize,
+                                                                smemFoundTopKValues,
+                                                                smemFinal,
+                                                                stride1,
+                                                                rowStart,
+                                                                topK);
 
     if (continueToNextStep) {
-        continueToNextStep =
-            processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-                indices,
-                logits,
-                rowEnd,
-                logitPattern,
-                thresholdBinIdx,
-                smemOutput,
-                smemThresholdBinIdx,
-                smemFinalDstIdx,
-                smemFinalBinSize,
-                smemFoundTopKValues,
-                smemFinal,
-                stride1,
-                rowStart,
-                topK);
+        continueToNextStep = processHistogramStep<LogitT,
+                                                  1,
+                                                  kNumThreadsPerBlock,
+                                                  kNumBins,
+                                                  kNumFinalItems,
+                                                  multipleBlocksPerRow,
+                                                  mergeBlocks>(indices,
+                                                               logits,
+                                                               rowEnd,
+                                                               logitPattern,
+                                                               thresholdBinIdx,
+                                                               smemOutput,
+                                                               smemThresholdBinIdx,
+                                                               smemFinalDstIdx,
+                                                               smemFinalBinSize,
+                                                               smemFoundTopKValues,
+                                                               smemFinal,
+                                                               stride1,
+                                                               rowStart,
+                                                               topK);
     }
     if (continueToNextStep) {
-        continueToNextStep =
-            processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-                indices,
-                logits,
-                rowEnd,
-                logitPattern,
-                thresholdBinIdx,
-                smemOutput,
-                smemThresholdBinIdx,
-                smemFinalDstIdx,
-                smemFinalBinSize,
-                smemFoundTopKValues,
-                smemFinal,
-                stride1,
-                rowStart,
-                topK);
+        continueToNextStep = processHistogramStep<LogitT,
+                                                  2,
+                                                  kNumThreadsPerBlock,
+                                                  kNumBins,
+                                                  kNumFinalItems,
+                                                  multipleBlocksPerRow,
+                                                  mergeBlocks>(indices,
+                                                               logits,
+                                                               rowEnd,
+                                                               logitPattern,
+                                                               thresholdBinIdx,
+                                                               smemOutput,
+                                                               smemThresholdBinIdx,
+                                                               smemFinalDstIdx,
+                                                               smemFinalBinSize,
+                                                               smemFoundTopKValues,
+                                                               smemFinal,
+                                                               stride1,
+                                                               rowStart,
+                                                               topK);
     }
     if (continueToNextStep) {
-        processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
-            indices,
-            logits,
-            rowEnd,
-            logitPattern,
-            thresholdBinIdx,
-            smemOutput,
-            smemThresholdBinIdx,
-            smemFinalDstIdx,
-            smemFinalBinSize,
-            smemFoundTopKValues,
-            smemFinal,
-            stride1,
-            rowStart,
-            topK);
+        processHistogramStep<LogitT,
+                             3,
+                             kNumThreadsPerBlock,
+                             kNumBins,
+                             kNumFinalItems,
+                             multipleBlocksPerRow,
+                             mergeBlocks>(indices,
+                                          logits,
+                                          rowEnd,
+                                          logitPattern,
+                                          thresholdBinIdx,
+                                          smemOutput,
+                                          smemThresholdBinIdx,
+                                          smemFinalDstIdx,
+                                          smemFinalBinSize,
+                                          smemFoundTopKValues,
+                                          smemFinal,
+                                          stride1,
+                                          rowStart,
+                                          topK);
     }
 
     if (!continueToNextStep) {
@@ -428,8 +448,8 @@ static __device__ void topKPerRowJob(const int*   indices,
                 int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
                 if (srcIdx < smemFinalDstIdx[0]) {
                     finalIndices[ii] = smemFinal.items.indices[srcIdx];
-                    finalKeys[ii] = make_deterministic_sort_key(
-                        smemFinal.items.logits[srcIdx], smemFinal.items.indices[srcIdx]);
+                    finalKeys[ii] =
+                        make_deterministic_sort_key(smemFinal.items.logits[srcIdx], smemFinal.items.indices[srcIdx]);
                 }
             }
             __syncthreads();
@@ -442,7 +462,8 @@ static __device__ void topKPerRowJob(const int*   indices,
                 if (dstIdx < topK) {
                     smemOutput[dstIdx] = finalIndices[ii];
                     if constexpr (multipleBlocksPerRow) {
-                        reinterpret_cast<float*>(smemOutput + topK)[dstIdx] = logits[finalIndices[ii] * stride1];
+                        reinterpret_cast<float*>(smemOutput + topK)[dstIdx] =
+                            static_cast<float>(logits[finalIndices[ii] * stride1]);
                     }
                 }
             }
@@ -483,16 +504,16 @@ static __device__ void topKPerRowJob(const int*   indices,
     }
 }
 
-template<int kNumThreadsPerBlock, bool useRadixSort>
-static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(const float* logits,
-                                                                                const int*   rowStarts,
-                                                                                const int*   rowEnds,
-                                                                                const int*   rowIndices,
-                                                                                int*         outIndices,
-                                                                                int          stride0,
-                                                                                int          stride1,
-                                                                                const int    topK,
-                                                                                const int    offsetIndex) {
+template<typename LogitT, int kNumThreadsPerBlock, bool useRadixSort>
+static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(const LogitT* logits,
+                                                                                const int*    rowStarts,
+                                                                                const int*    rowEnds,
+                                                                                const int*    rowIndices,
+                                                                                int*          outIndices,
+                                                                                int           stride0,
+                                                                                int           stride1,
+                                                                                const int     topK,
+                                                                                const int     offsetIndex) {
     static constexpr int kNumBins = 2048;
 
     int scheduleIdx = blockIdx.x + offsetIndex;
