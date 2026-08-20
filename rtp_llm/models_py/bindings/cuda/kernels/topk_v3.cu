@@ -112,16 +112,16 @@ __global__ __launch_bounds__(kBlockSize, kOccupancy) void main_kernel(const __gr
     }
     __shared__ impl::MaxSmem<Register1::Smem, Register2::Smem, Register4::Smem, Streaming::Smem> smem;
     if constexpr (Level == -1) {
-        Register1::forward<kAlignedInput>(problem, &smem);
+        Register1::forward<false, kAlignedInput>(problem, &smem);
     } else if constexpr (Level == 0) {
-        Register2::forward<kAlignedInput>(problem, &smem);
+        Register2::forward<false, kAlignedInput>(problem, &smem);
     } else if constexpr (Level == 1) {
-        Register4::forward<kAlignedInput>(problem, &smem);
+        Register4::forward<false, kAlignedInput>(problem, &smem);
     } else {
         if (problem.seq_len <= kReg4MaxSeqLen) {
-            Register4::forward<kAlignedInput>(problem, &smem);
+            Register4::forward<false, kAlignedInput>(problem, &smem);
         } else {
-            Streaming::forward<kAlignedInput>(problem, &smem);
+            Streaming::forward<false, kAlignedInput>(problem, &smem);
         }
     }
 }
@@ -141,7 +141,7 @@ __global__ __launch_bounds__(kBlockSize, kOccupancy) void direct_cluster_kernel(
     auto*                                                destination = problem.out;
     const auto                                           cluster     = cooperative_groups::this_cluster();
     problem.out                                                      = cluster.map_shared_rank(indices, worker_rank);
-    ClusterImpl::template forward<kAlignedInput>(problem, &smem);
+    ClusterImpl::template forward<false, kAlignedInput>(problem, &smem);
     cluster.sync();
     if (blockIdx.y == worker_rank)
         copy_output(problem, destination);
@@ -163,7 +163,7 @@ __global__ __launch_bounds__(kBlockSize,
                 trivial(problem);
         } else {
             problem.out = cluster.map_shared_rank(indices, worker_rank);
-            ClusterImpl::template forward<kAlignedInput>(problem, &smem);
+            ClusterImpl::template forward<false, kAlignedInput>(problem, &smem);
             cluster.sync();
             if (blockIdx.y == worker_rank)
                 copy_output(problem, destination);

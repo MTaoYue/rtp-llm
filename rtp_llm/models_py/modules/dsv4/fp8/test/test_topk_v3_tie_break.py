@@ -28,7 +28,9 @@ def _run(
     return output
 
 
-def _clamped_window(start: int, end: int, width: int, max_seq_len: int) -> tuple[int, int]:
+def _clamped_window(
+    start: int, end: int, width: int, max_seq_len: int
+) -> tuple[int, int]:
     start = min(max(start, 0), width)
     end = min(max(end, start), width)
     end = min(end, start + max_seq_len)
@@ -123,12 +125,12 @@ def _assert_stable_equiv(
         actual = output_host[row, :keep].to(torch.int64)
         padding = output_host[row, keep:]
         assert (padding == -1).all(), f"{tag}: row {row} padding is not -1"
-        assert ((actual >= 0) & (actual < length)).all(), (
-            f"{tag}: row {row} returned an out-of-window relative index"
-        )
-        assert torch.unique(actual).numel() == keep, (
-            f"{tag}: row {row} returned duplicate indices"
-        )
+        assert (
+            (actual >= 0) & (actual < length)
+        ).all(), f"{tag}: row {row} returned an out-of-window relative index"
+        assert (
+            torch.unique(actual).numel() == keep
+        ), f"{tag}: row {row} returned duplicate indices"
         expected = _stable_reference_indices(scores[row, start:end], keep).cpu()
         assert torch.equal(actual.sort().values, expected.sort().values), (
             f"{tag}: row {row} stable index set mismatch\n"
@@ -215,9 +217,7 @@ def test_negative_zero_coarse_threshold_matches_per_row() -> None:
     k = 512
     for length, start, path in ((8192, 9, "register"), (32771, 13, "streaming")):
         width = length + start + 7
-        scores = torch.full(
-            (1, width), torch.inf, device="cuda", dtype=torch.float32
-        )
+        scores = torch.full((1, width), torch.inf, device="cuda", dtype=torch.float32)
         window = torch.full((length,), -1.0, device="cuda", dtype=torch.float32)
         above = k // 2
         negative_zero_count = k
@@ -308,9 +308,7 @@ def test_signed_nan_threshold_bins_match_per_row() -> None:
     # Streaming path: the negative-NaN threshold interval overflows the
     # candidate buffer and exercises the exact rescan before index tie-break.
     length, start, k = 32771, 11, 512
-    scores = torch.empty(
-        (1, length + start + 5), device="cuda", dtype=torch.float32
-    )
+    scores = torch.empty((1, length + start + 5), device="cuda", dtype=torch.float32)
     window = scores[0, start : start + length]
     window[:] = lower_negative_nan
     window[:192] = positive_nan
@@ -364,9 +362,7 @@ def test_multi_request_nonzero_starts_ignore_poison() -> None:
             length, device="cuda", generator=generator
         )
     output = _run(scores, starts, ends, k, width)
-    _assert_stable_equiv(
-        output, scores, starts, ends, k, width, "multi-request poison"
-    )
+    _assert_stable_equiv(output, scores, starts, ends, k, width, "multi-request poison")
 
 
 def test_unaligned_score_view_and_row_starts() -> None:
@@ -380,6 +376,43 @@ def test_unaligned_score_view_and_row_starts() -> None:
     output = _run(scores, starts, ends, k, width)
     _assert_stable_equiv(
         output, scores, starts, ends, k, width, "unaligned scores and starts"
+    )
+
+
+def test_bf16_aligned_and_row_unaligned_inputs() -> None:
+    rows, width, k, length = 4, 16388, 1024, 8193
+    generator = torch.Generator(device="cuda").manual_seed(2026082001)
+    scores = torch.randn(
+        rows, width, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    assert scores.data_ptr() % 8 == 0 and scores.stride(0) % 4 == 0
+    starts = torch.tensor([0, 1, 4, 7], dtype=torch.int32, device="cuda")
+    ends = starts + length
+    output = _run(scores, starts, ends, k, length)
+    _assert_stable_equiv(
+        output,
+        scores,
+        starts,
+        ends,
+        k,
+        length,
+        "BF16 aligned base with mixed row starts",
+    )
+
+
+def test_bf16_unaligned_score_view() -> None:
+    rows, width, k, length = 4, 16388, 1024, 8193
+    generator = torch.Generator(device="cuda").manual_seed(2026082002)
+    storage = torch.randn(
+        rows, width + 1, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    scores = storage[:, 1 : width + 1]
+    assert scores.stride(1) == 1 and scores.data_ptr() % 8 != 0
+    starts = torch.tensor([0, 3, 5, 9], dtype=torch.int32, device="cuda")
+    ends = starts + length
+    output = _run(scores, starts, ends, k, length)
+    _assert_stable_equiv(
+        output, scores, starts, ends, k, length, "BF16 unaligned score view"
     )
 
 
@@ -418,9 +451,9 @@ def test_stable_selected_set_across_replays() -> None:
         if expected_set is None:
             expected_set = selected
         else:
-            assert torch.equal(selected, expected_set), (
-                f"stable tie-break changed selected set on replay {replay}"
-            )
+            assert torch.equal(
+                selected, expected_set
+            ), f"stable tie-break changed selected set on replay {replay}"
 
 
 def test_empty_batch_is_noop() -> None:
@@ -445,6 +478,8 @@ if __name__ == "__main__":
     test_dense_discrete_ties_register_and_streaming()
     test_multi_request_nonzero_starts_ignore_poison()
     test_unaligned_score_view_and_row_starts()
+    test_bf16_aligned_and_row_unaligned_inputs()
+    test_bf16_unaligned_score_view()
     test_bounds_clamp_empty_rows_and_padding()
     test_stable_selected_set_across_replays()
     test_empty_batch_is_noop()

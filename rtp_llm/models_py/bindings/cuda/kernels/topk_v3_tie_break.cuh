@@ -27,7 +27,7 @@ SGL_DEVICE uint32_t stable_score_key(float value) {
     return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
 }
 
-template<typename Predicate, typename KeyFn>
+template<bool kBf16, typename Predicate, typename KeyFn>
 SGL_DEVICE uint32_t radix_select_problem(const TopKProblem&                        problem,
                                          uint32_t                                  rank,
                                          typename base::TopKConfig::TieHandleSmem* smem,
@@ -47,7 +47,7 @@ SGL_DEVICE uint32_t radix_select_problem(const TopKProblem&                     
         const uint32_t shift = 24u - round * 8u;
         const uint32_t mask  = round == 0 ? 0u : (~0u << (32u - round * 8u));
         for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-            const float    value = problem.load(idx);
+            const float    value = problem.load<kBf16>(idx);
             const uint32_t key   = key_fn(value, idx);
             if (predicate(value, idx) && (key & mask) == prefix) {
                 atomicAdd(&smem->histogram[0][(key >> shift) & 0xffu], 1u);
@@ -360,7 +360,7 @@ SGL_DEVICE bool needs_exact_coarse_classification(uint32_t threshold_bin) {
 // Candidate-buffer overflow fallback. It performs the same stable score then
 // index radix selection while rescanning the coarse threshold interval, or the
 // whole row for the non-monotonic canonical NaN bin.
-template<uint32_t kHistBits>
+template<bool kBf16, uint32_t kHistBits>
 SGL_DEVICE void stable_exact_boundary_scan_topk(const TopKProblem&                        problem,
                                                 typename base::TopKConfig::TieHandleSmem* smem,
                                                 uint32_t                                  threshold_bin,
@@ -381,7 +381,7 @@ SGL_DEVICE void stable_exact_boundary_scan_topk(const TopKProblem&              
         }
         return in_threshold_bin<kHistBits>(value, threshold_bin);
     };
-    const uint32_t threshold_score_key = radix_select_problem(
+    const uint32_t threshold_score_key = radix_select_problem<kBf16>(
         problem, remaining_topk, smem, in_interval, [](float value, uint32_t) { return stable_score_key(value); });
 
     if (tx == 0) {
@@ -390,7 +390,7 @@ SGL_DEVICE void stable_exact_boundary_scan_topk(const TopKProblem&              
     }
     __syncthreads();
     for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-        const float value = problem.load(idx);
+        const float value = problem.load<kBf16>(idx);
         if (!in_interval(value, idx)) {
             continue;
         }
@@ -411,7 +411,7 @@ SGL_DEVICE void stable_exact_boundary_scan_topk(const TopKProblem&              
     }
     __syncthreads();
     for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-        const float value = problem.load(idx);
+        const float value = problem.load<kBf16>(idx);
         if (in_interval(value, idx) && stable_score_key(value) > threshold_score_key) {
             const uint32_t pos = atomicAdd(&smem->counter, 1u);
             problem.emit(output_base + pos, idx);
@@ -425,7 +425,7 @@ SGL_DEVICE void stable_exact_boundary_scan_topk(const TopKProblem&              
         }
         __syncthreads();
         for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-            const float value = problem.load(idx);
+            const float value = problem.load<kBf16>(idx);
             if (in_interval(value, idx) && stable_score_key(value) == threshold_score_key) {
                 const uint32_t pos = atomicAdd(&smem->counter_final, 1u);
                 problem.emit(output_base + exact_above + pos, idx);
@@ -434,7 +434,7 @@ SGL_DEVICE void stable_exact_boundary_scan_topk(const TopKProblem&              
         return;
     }
 
-    const uint32_t threshold_index_key = radix_select_problem(
+    const uint32_t threshold_index_key = radix_select_problem<kBf16>(
         problem,
         need_equal,
         smem,
@@ -448,7 +448,7 @@ SGL_DEVICE void stable_exact_boundary_scan_topk(const TopKProblem&              
     }
     __syncthreads();
     for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-        const float value = problem.load(idx);
+        const float value = problem.load<kBf16>(idx);
         if (in_interval(value, idx) && stable_score_key(value) == threshold_score_key
             && 0xffffffffu - idx >= threshold_index_key) {
             const uint32_t pos = atomicAdd(&smem->counter_final, 1u);
@@ -464,8 +464,9 @@ struct TopKRegister: base::TopKRadixBase<12> {
     using Base                           = base::TopKRadixBase<12>;
     using Smem                           = Base::Smem;
     using vec_t                          = typename Base::vec_t;
+    using bf16_vec_t                     = typename Base::bf16_vec_t;
 
-    template<bool kAlignedInput>
+    template<bool kBf16, bool kAlignedInput>
     SGL_DEVICE static void forward(const TopKProblem problem, void* raw_smem) {
         const uint32_t          tx   = threadIdx.x;
         auto*                   smem = static_cast<Smem*>(raw_smem);
@@ -492,9 +493,15 @@ struct TopKRegister: base::TopKRadixBase<12> {
             if (vi >= num_full) {
                 break;
             }
-            if (problem.bf16) {
+            if constexpr (kBf16) {
+                bf16_vec_t bf16_vec;
+                if constexpr (kAlignedInput) {
+                    bf16_vec.load(problem.in_bf16, vi);
+                } else {
+                    bf16_vec.load_unaligned(problem.in_bf16, vi);
+                }
                 for (uint32_t j = 0; j < kVecSize; ++j) {
-                    local_vecs[i][j] = problem.load(vi * kVecSize + j);
+                    local_vecs[i][j] = __bfloat162float(bf16_vec[j]);
                 }
             } else if constexpr (kAlignedInput) {
                 local_vecs[i].load(problem.in, vi);
@@ -515,7 +522,7 @@ struct TopKRegister: base::TopKRadixBase<12> {
         }
         if (owns_tail) {
             const uint32_t idx = tail_start + tx - (kBlockSize - tail);
-            tail_value         = problem.load(idx);
+            tail_value         = problem.load<kBf16>(idx);
             atomicAdd(&smem->histogram[base::extract_coarse_bin<Base::kHistBits>(tail_value)], 1u);
         }
         __syncthreads();
@@ -588,7 +595,7 @@ struct TopKRegister: base::TopKRadixBase<12> {
         const uint32_t equal_count = smem->count_eq;
         if (equal_count > kMaxNumTie) {
             if (above_count < topk) {
-                stable_exact_boundary_scan_topk<Base::kHistBits>(
+                stable_exact_boundary_scan_topk<kBf16, Base::kHistBits>(
                     problem, &smem->tie.handle, threshold_bin, above_count);
             }
             return;
@@ -605,7 +612,7 @@ struct TopKRegister: base::TopKRadixBase<12> {
 struct TopKStreaming: TopKRegister<2> {
     static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-    template<bool kAlignedInput>
+    template<bool kBf16, bool kAlignedInput>
     SGL_DEVICE static void forward(const TopKProblem problem, void* raw_smem) {
         const uint32_t          tx   = threadIdx.x;
         auto*                   smem = static_cast<Smem*>(raw_smem);
@@ -618,7 +625,7 @@ struct TopKStreaming: TopKRegister<2> {
         }
         __syncthreads();
 
-        Base::template for_each_input<kAlignedInput>(problem, problem.seq_len, [&](float value, uint32_t) {
+        Base::template for_each_input<kBf16, kAlignedInput>(problem, problem.seq_len, [&](float value, uint32_t) {
             atomicAdd(&smem->histogram[base::extract_coarse_bin<Base::kHistBits>(value)], 1u);
         });
         __syncthreads();
@@ -642,29 +649,31 @@ struct TopKStreaming: TopKRegister<2> {
             }
         };
         if (__builtin_expect(exact_coarse_classification, false)) {
-            Base::template for_each_input<kAlignedInput>(problem, problem.seq_len, [&](float value, uint32_t idx) {
-                const uint32_t bin = base::extract_coarse_bin<Base::kHistBits>(value);
-                if (bin > threshold_bin) {
-                    collect_above(idx);
-                } else if (bin == threshold_bin) {
-                    collect_equal(value, idx);
-                }
-            });
-        } else {
-            Base::template for_each_input<kAlignedInput>(problem, problem.seq_len, [&](float value, uint32_t idx) {
-                if (value >= v_hi) {
-                    collect_above(idx);
-                } else if (value >= v_lo) {
-                    collect_equal(value, idx);
-                } else if (base::is_nan(value)) {
+            Base::template for_each_input<kBf16, kAlignedInput>(
+                problem, problem.seq_len, [&](float value, uint32_t idx) {
                     const uint32_t bin = base::extract_coarse_bin<Base::kHistBits>(value);
                     if (bin > threshold_bin) {
                         collect_above(idx);
                     } else if (bin == threshold_bin) {
                         collect_equal(value, idx);
                     }
-                }
-            });
+                });
+        } else {
+            Base::template for_each_input<kBf16, kAlignedInput>(
+                problem, problem.seq_len, [&](float value, uint32_t idx) {
+                    if (value >= v_hi) {
+                        collect_above(idx);
+                    } else if (value >= v_lo) {
+                        collect_equal(value, idx);
+                    } else if (base::is_nan(value)) {
+                        const uint32_t bin = base::extract_coarse_bin<Base::kHistBits>(value);
+                        if (bin > threshold_bin) {
+                            collect_above(idx);
+                        } else if (bin == threshold_bin) {
+                            collect_equal(value, idx);
+                        }
+                    }
+                });
         }
         __syncthreads();
 
@@ -672,7 +681,7 @@ struct TopKStreaming: TopKRegister<2> {
         const uint32_t equal_count = smem->count_eq;
         if (equal_count > kMaxNumTie) {
             if (above_count < topk) {
-                stable_exact_boundary_scan_topk<Base::kHistBits>(
+                stable_exact_boundary_scan_topk<kBf16, Base::kHistBits>(
                     problem, &smem->tie.handle, threshold_bin, above_count);
             }
             return;

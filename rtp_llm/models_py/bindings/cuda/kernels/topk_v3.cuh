@@ -191,8 +191,13 @@ struct TopKProblem {
     uint32_t seq_len;
     uint32_t page_bits;
 
+    template<bool kBf16>
     SGL_DEVICE float load(uint32_t idx) const {
-        return bf16 ? __bfloat162float(in_bf16[idx]) : in[idx];
+        if constexpr (kBf16) {
+            return __bfloat162float(in_bf16[idx]);
+        } else {
+            return in[idx];
+        }
     }
 
     // Write the raw selected index; the page-table transform is applied afterwards
@@ -249,6 +254,7 @@ struct TopKConfig {
     /// than the fixed shared-memory tie buffer can hold. Re-scan only that
     /// coarse value interval and skip any FP32 key bytes shared by both interval
     /// endpoints. Values above the interval have already been emitted.
+    template<bool kBf16>
     SGL_DEVICE static void exact_boundary_scan_topk(
         const TopKProblem& problem, TieHandleSmem* smem, float v_lo, float v_hi, uint32_t output_base) {
         const uint32_t tx = threadIdx.x;
@@ -283,7 +289,7 @@ struct TopKConfig {
             const uint32_t mask   = round == 0 ? 0u : (~0u << (32u - round * 8u));
             const uint32_t shift  = 24u - round * 8u;
             for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-                const float    value = problem.load(idx);
+                const float    value = problem.load<kBf16>(idx);
                 const uint32_t key   = extract_exact_bin(value);
                 if (value >= v_lo && value < v_hi && (key & mask) == prefix) {
                     atomicAdd(&smem->histogram[0][(key >> shift) & 0xffu], 1u);
@@ -329,7 +335,7 @@ struct TopKConfig {
             smem->counter = 0;
         __syncthreads();
         for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-            const float value = problem.load(idx);
+            const float value = problem.load<kBf16>(idx);
             if (value >= v_lo && value < v_hi && extract_exact_bin(value) > pivot) {
                 const uint32_t pos = atomicAdd(&smem->counter, 1u);
                 problem.emit(output_base + pos, idx);
@@ -337,7 +343,7 @@ struct TopKConfig {
         }
         __syncthreads();
         for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-            const float value = problem.load(idx);
+            const float value = problem.load<kBf16>(idx);
             if (value >= v_lo && value < v_hi && extract_exact_bin(value) == pivot) {
                 const uint32_t pos = atomicAdd(&smem->counter, 1u);
                 if (output_base + pos < problem.topk) {
@@ -560,6 +566,7 @@ struct TopKRadixBase: TopKConfig {
     static constexpr uint32_t kHistBits = kHistBits_;
     static constexpr uint32_t kHistSize = 1 << kHistBits;
     using vec_t                         = AlignedVector<float, kVecSize>;
+    using bf16_vec_t                    = AlignedVector<__nv_bfloat16, kVecSize>;
 
     struct Smem {
         using kHistVec = AlignedVector<uint32_t, kHistSize / kBlockSize>;
@@ -585,11 +592,40 @@ struct TopKRadixBase: TopKConfig {
     };
 
 protected:
-    template<bool kAlignedInput, typename F>
+    template<bool kBf16, bool kAlignedInput, typename F>
     SGL_DEVICE static void for_each_input(const TopKProblem& problem, uint32_t seq_len, F&& fn) {
-        if (problem.bf16) {
-            for (uint32_t idx = threadIdx.x; idx < seq_len; idx += kBlockSize) {
-                fn(problem.load(idx), idx);
+        if constexpr (kBf16) {
+            const auto     tx         = threadIdx.x;
+            const uint32_t num_full   = seq_len / kVecSize;
+            const uint32_t tail_start = num_full * kVecSize;
+            bf16_vec_t     next_vec;
+            uint32_t       vi = tx;
+            if (vi < num_full) {
+                if constexpr (kAlignedInput) {
+                    next_vec.load(problem.in_bf16, vi);
+                } else {
+                    next_vec.load_unaligned(problem.in_bf16, vi);
+                }
+            }
+            while (vi < num_full) {
+                const auto cur  = next_vec;
+                const auto base = vi * kVecSize;
+                vi += kBlockSize;
+                if (vi < num_full) {
+                    if constexpr (kAlignedInput) {
+                        next_vec.load(problem.in_bf16, vi);
+                    } else {
+                        next_vec.load_unaligned(problem.in_bf16, vi);
+                    }
+                }
+#pragma unroll
+                for (uint32_t j = 0; j < kVecSize; ++j) {
+                    fn(__bfloat162float(cur[j]), base + j);
+                }
+            }
+            if (tx < seq_len - tail_start) {
+                const auto idx = tail_start + tx;
+                fn(problem.load<kBf16>(idx), idx);
             }
             return;
         }
@@ -683,7 +719,7 @@ struct TopKRegister: TopKRadixBase<12> {
     static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
     using Smem                           = typename TopKRadixBase<12>::Smem;
 
-    template<bool kAlignedInput>
+    template<bool kBf16, bool kAlignedInput>
     SGL_DEVICE static void forward(const TopKProblem problem, void* _smem) {
         const auto tx   = threadIdx.x;
         const auto smem = static_cast<Smem*>(_smem);
@@ -715,9 +751,15 @@ struct TopKRegister: TopKRadixBase<12> {
             const auto vi = tx + kBlockSize * i;
             if (vi >= num_full)
                 break;
-            if (problem.bf16) {
+            if constexpr (kBf16) {
+                bf16_vec_t bf16_vec;
+                if constexpr (kAlignedInput) {
+                    bf16_vec.load(problem.in_bf16, vi);
+                } else {
+                    bf16_vec.load_unaligned(problem.in_bf16, vi);
+                }
                 for (uint32_t j = 0; j < kVecSize; ++j) {
-                    local_vecs[i][j] = problem.load(vi * kVecSize + j);
+                    local_vecs[i][j] = __bfloat162float(bf16_vec[j]);
                 }
             } else if constexpr (kAlignedInput) {
                 local_vecs[i].load(problem.in, vi);
@@ -736,7 +778,7 @@ struct TopKRegister: TopKRadixBase<12> {
         }
         if (tx >= kBlockSize - tail) {
             const uint32_t idx = tail_start + tx - (kBlockSize - tail);
-            atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(problem.load(idx))], 1);
+            atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(problem.load<kBf16>(idx))], 1);
         }
         __syncthreads();
 
@@ -771,7 +813,7 @@ struct TopKRegister: TopKRadixBase<12> {
         }
         if (tx >= kBlockSize - tail) {
             const uint32_t idx = tail_start + tx - (kBlockSize - tail);
-            collect(problem.load(idx), idx);
+            collect(problem.load<kBf16>(idx), idx);
         }
 
         // Phase 4: Handle ties.
@@ -783,7 +825,7 @@ struct TopKRegister: TopKRadixBase<12> {
             // In that case the output is already complete; do not underflow the
             // exact scan's topk - output_base calculation.
             if (above_count < topk) {
-                exact_boundary_scan_topk(problem, &smem->tie.handle, v_lo, v_hi, above_count);
+                exact_boundary_scan_topk<kBf16>(problem, &smem->tie.handle, v_lo, v_hi, above_count);
             }
             return;
         }
@@ -801,7 +843,7 @@ struct TopKStreaming: TopKRegister<2> {
 public:
     static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-    template<bool kAlignedInput>
+    template<bool kBf16, bool kAlignedInput>
     SGL_DEVICE static void forward(const TopKProblem problem, void* _smem) {
         const auto tx   = threadIdx.x;
         const auto smem = static_cast<Smem*>(_smem);
@@ -817,7 +859,7 @@ public:
         }
         __syncthreads();
         // Phase 1: Load and build histogram
-        for_each_input<kAlignedInput>(problem, problem.seq_len, [&](float val, uint32_t) {
+        for_each_input<kBf16, kAlignedInput>(problem, problem.seq_len, [&](float val, uint32_t) {
             const auto bin = extract_coarse_bin<kHistBits>(val);
             atomicAdd(&smem->histogram[bin], 1);
         });
@@ -835,7 +877,7 @@ public:
         const float v_hi          = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
         const float v_lo          = coarse_bin_lower_bound<kHistBits>(threshold_bin);
         const auto  topk          = problem.topk;
-        for_each_input<kAlignedInput>(problem, problem.seq_len, [&](float val, uint32_t idx) {
+        for_each_input<kBf16, kAlignedInput>(problem, problem.seq_len, [&](float val, uint32_t idx) {
             if (is_nan(val) || val >= v_hi) {
                 const auto pos = atomicAdd(&smem->count_gt, 1);
                 if (pos < topk) [[likely]] {
@@ -860,7 +902,7 @@ public:
         const auto equal_count = smem->count_eq;
         if (__builtin_expect(equal_count > kMaxNumTie, 0)) {
             if (above_count < topk) {
-                exact_boundary_scan_topk(problem, &smem->tie.handle, v_lo, v_hi, above_count);
+                exact_boundary_scan_topk<kBf16>(problem, &smem->tie.handle, v_lo, v_hi, above_count);
             }
             return;
         }
@@ -891,13 +933,13 @@ public:
     // the kernel performs cluster.sync() after
     // each forward(). Writes raw indices to out; the kernel's transform pass
     // applies the page-table transform.
-    template<bool kAlignedInput>
+    template<bool kBf16, bool kAlignedInput>
     SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
-        forward_impl<kAlignedInput>(problem, _smem);
+        forward_impl<kBf16, kAlignedInput>(problem, _smem);
     }
 
 private:
-    template<bool kAlignedInput>
+    template<bool kBf16, bool kAlignedInput>
     SGL_DEVICE static void forward_impl(TopKProblem problem, void* _smem) {
         const auto tx         = threadIdx.x;
         const auto smem       = static_cast<Smem*>(_smem);
@@ -910,7 +952,11 @@ private:
         const uint32_t     chunk_start   = min(this_rank * chunk_size, problem.seq_len);
         const uint32_t     chunk_finish  = min(chunk_start + chunk_size, problem.seq_len);
         const uint32_t     local_seq_len = chunk_finish - chunk_start;
-        problem.in += chunk_start;
+        if constexpr (kBf16) {
+            problem.in_bf16 += chunk_start;
+        } else {
+            problem.in += chunk_start;
+        }
 
         typename Smem::kHistVec hist_vec;
         hist_vec.fill(0);
@@ -922,7 +968,7 @@ private:
         __syncthreads();
 
         // Phase 1: Load and build histogram over this rank's contiguous chunk.
-        for_each_input<kAlignedInput>(problem, local_seq_len, [&](float val, uint32_t) {
+        for_each_input<kBf16, kAlignedInput>(problem, local_seq_len, [&](float val, uint32_t) {
             const auto bin = extract_coarse_bin<kHistBits>(val);
             atomicAdd(&smem->histogram[bin], 1);
         });
@@ -957,7 +1003,7 @@ private:
         const float v_hi          = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
         const float v_lo          = coarse_bin_lower_bound<kHistBits>(threshold_bin);
         const auto  cur_out       = is_primary ? problem.out : smem->tmp_out;
-        for_each_input<kAlignedInput>(problem, local_seq_len, [&](float val, uint32_t local_idx) {
+        for_each_input<kBf16, kAlignedInput>(problem, local_seq_len, [&](float val, uint32_t local_idx) {
             const auto idx = chunk_start + local_idx;
             if (is_nan(val) || val >= v_hi) {
                 const auto pos = atomicAdd(&smem->count_gt, 1);
@@ -1020,7 +1066,7 @@ private:
             const auto equal_count = smem->count_eq;
             if (__builtin_expect(equal_count > kMaxNumTie, 0)) {
                 if (above_count < topk) {
-                    exact_boundary_scan_topk(problem, &smem->tie.handle, v_lo, v_hi, above_count);
+                    exact_boundary_scan_topk<kBf16>(problem, &smem->tie.handle, v_lo, v_hi, above_count);
                 }
             } else {
                 const auto remain_topk = above_count < topk ? topk - above_count : 0;

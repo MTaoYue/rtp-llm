@@ -65,17 +65,23 @@ __device__ __forceinline__ void trivial(const TopKProblem& problem) {
     }
 }
 
-template<typename Implementation>
+template<bool kBf16, typename Implementation, bool kAlignedInput>
 __device__ __forceinline__ void run_implementation(const TopKProblem& problem, void* smem) {
-    const bool aligned = !problem.bf16 && (reinterpret_cast<uintptr_t>(problem.in) & 0xfu) == 0u;
-    if (aligned) {
-        Implementation::template forward<true>(problem, smem);
+    if constexpr (kAlignedInput) {
+        const uintptr_t input_ptr =
+            kBf16 ? reinterpret_cast<uintptr_t>(problem.in_bf16) : reinterpret_cast<uintptr_t>(problem.in);
+        const uintptr_t alignment_mask = kBf16 ? 0x7u : 0xfu;
+        if ((input_ptr & alignment_mask) == 0u) {
+            Implementation::template forward<kBf16, true>(problem, smem);
+        } else {
+            Implementation::template forward<kBf16, false>(problem, smem);
+        }
     } else {
-        Implementation::template forward<false>(problem, smem);
+        Implementation::template forward<kBf16, false>(problem, smem);
     }
 }
 
-template<int Level>
+template<int Level, bool kBf16, bool kAlignedInput>
 __global__ __launch_bounds__(kBlockSize, kOccupancy) void main_kernel(const __grid_constant__ Params params) {
     device::enable_smem_spilling();
     const TopKProblem problem = params.problem(blockIdx.x);
@@ -85,25 +91,26 @@ __global__ __launch_bounds__(kBlockSize, kOccupancy) void main_kernel(const __gr
     }
     __shared__ base::MaxSmem<Register1::Smem, Register2::Smem, Register4::Smem, Streaming::Smem> smem;
     if constexpr (Level == -1) {
-        run_implementation<Register1>(problem, &smem);
+        run_implementation<kBf16, Register1, kAlignedInput>(problem, &smem);
     } else if constexpr (Level == 0) {
-        run_implementation<Register2>(problem, &smem);
+        run_implementation<kBf16, Register2, kAlignedInput>(problem, &smem);
     } else if constexpr (Level == 1) {
-        run_implementation<Register4>(problem, &smem);
+        run_implementation<kBf16, Register4, kAlignedInput>(problem, &smem);
     } else {
-        run_implementation<Streaming>(problem, &smem);
+        run_implementation<kBf16, Streaming, kAlignedInput>(problem, &smem);
     }
 }
 
+template<bool kBf16, bool kAlignedInput>
 cudaError_t launch_topk(const Params& params, int64_t k, int64_t max_seq_len, cudaStream_t stream) {
     if (max_seq_len <= Register1::kMaxSeqLen && (params.rows <= 32 || k <= 1024)) {
-        main_kernel<-1><<<params.rows, kBlockSize, 0, stream>>>(params);
+        main_kernel<-1, kBf16, kAlignedInput><<<params.rows, kBlockSize, 0, stream>>>(params);
     } else if (max_seq_len <= Register2::kMaxSeqLen) {
-        main_kernel<0><<<params.rows, kBlockSize, 0, stream>>>(params);
+        main_kernel<0, kBf16, kAlignedInput><<<params.rows, kBlockSize, 0, stream>>>(params);
     } else if (max_seq_len <= Register4::kMaxSeqLen) {
-        main_kernel<1><<<params.rows, kBlockSize, 0, stream>>>(params);
+        main_kernel<1, kBf16, kAlignedInput><<<params.rows, kBlockSize, 0, stream>>>(params);
     } else {
-        main_kernel<2><<<params.rows, kBlockSize, 0, stream>>>(params);
+        main_kernel<2, kBf16, kAlignedInput><<<params.rows, kBlockSize, 0, stream>>>(params);
     }
     return cudaGetLastError();
 }
@@ -155,8 +162,14 @@ void topk_v3_tie_break(const torch::Tensor& scores,
                       .topk        = static_cast<uint32_t>(k),
                       .max_seq_len = static_cast<uint32_t>(max_seq_len),
     };
-    const auto        stream = at::cuda::getCurrentCUDAStream(scores.get_device());
-    const cudaError_t error  = launch_topk(params, k, max_seq_len, stream);
+    const auto      stream = at::cuda::getCurrentCUDAStream(scores.get_device());
+    const uintptr_t input_ptr =
+        bf16 ? reinterpret_cast<uintptr_t>(params.scores_bf16) : reinterpret_cast<uintptr_t>(params.scores);
+    const bool        aligned_input = (input_ptr & (bf16 ? 0x7u : 0xfu)) == 0u;
+    const cudaError_t error         = bf16 ? (aligned_input ? launch_topk<true, true>(params, k, max_seq_len, stream) :
+                                                              launch_topk<true, false>(params, k, max_seq_len, stream)) :
+                                             (aligned_input ? launch_topk<false, true>(params, k, max_seq_len, stream) :
+                                                              launch_topk<false, false>(params, k, max_seq_len, stream));
     TORCH_CHECK(error == cudaSuccess, "topk_v3_tie_break launch failed: ", cudaGetErrorString(error));
 }
 
