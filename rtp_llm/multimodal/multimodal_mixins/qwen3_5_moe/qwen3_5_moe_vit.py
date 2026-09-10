@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable
 
 import torch
@@ -280,9 +281,17 @@ class Qwen3_5MoeVisionAttention(nn.Module):
             .unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(
-            query_states, key_states, cos, sin
-        )
+        max_seqlen = kwargs.pop("vision_max_seqlen", None)
+        vision_lengths = kwargs.pop("vision_lengths", None)
+        vision_batch_size = kwargs.pop("vision_batch_size", 1)
+        if kwargs.pop("vision_fused_rope", False):
+            from .qwen3_5_vision_cuda import fused_rope
+
+            query_states, key_states = fused_rope(query_states, key_states, cos, sin)
+        else:
+            query_states, key_states = apply_rotary_pos_emb_vision(
+                query_states, key_states, cos, sin
+            )
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
@@ -292,9 +301,31 @@ class Qwen3_5MoeVisionAttention(nn.Module):
             self.config._attn_implementation, eager_attention_forward
         )
 
-        if default_attn_impl == "flash_attention_2":
+        if vision_batch_size > 1 and self.config._attn_implementation == "sdpa":
+            # Batch independent equal-length images/frames without padding.
+            # Keep the same attention interface and scale as the segmented path.
+            q, k, v = (
+                tensor.squeeze(0)
+                .transpose(0, 1)
+                .view(vision_batch_size, -1, self.num_heads, self.head_dim)
+                .transpose(1, 2)
+                for tensor in (query_states, key_states, value_states)
+            )
+            attn_output, _ = attention_interface(
+                self,
+                q,
+                k,
+                v,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                is_causal=False,
+                **kwargs,
+            )
+        elif default_attn_impl == "flash_attention_2":
             # Flash Attention: Use cu_seqlens for variable length attention
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            if max_seqlen is None:
+                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
                 self,
                 query_states,
@@ -310,11 +341,32 @@ class Qwen3_5MoeVisionAttention(nn.Module):
                 is_causal=False,
                 **kwargs,
             )
+        elif (
+            torch.compiler.is_compiling()
+            and not self.training
+            and self.config._attn_implementation == "sdpa"
+            and vision_lengths is not None
+            and len(vision_lengths) > 128
+            and not kwargs
+        ):
+            from .qwen3_5_vision_cuda import native_segmented_sdpa
+
+            attn_output = native_segmented_sdpa(
+                query_states,
+                key_states,
+                value_states,
+                list(vision_lengths),
+                self.scaling,
+            )
         else:
             # Other implementations: Process each chunk separately
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            lengths = (
+                vision_lengths
+                if vision_lengths is not None
+                else (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            )
             splits = [
-                torch.split(tensor, lengths.tolist(), dim=2)
+                torch.split(tensor, lengths, dim=2)
                 for tensor in (query_states, key_states, value_states)
             ]
 
@@ -529,7 +581,75 @@ class Qwen3_5MoeVisionModel(PreTrainedModel):
         patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
         return patch_pos_embeds
 
-    def forward(
+    def configure_vision(self, mode="baseline", **options):
+        """Select an optional CUDA inference mode; weights and output stay compatible."""
+        modes = {"baseline", "optimized", "compile", "cudagraph", "compile_cudagraph"}
+        if mode not in modes:
+            raise ValueError(f"Unknown vision execution mode: {mode}")
+        self.clear_vision_cache()
+        self._vision_mode = mode
+        self._vision_options = options
+        self._vision_runtime = None
+
+    def clear_vision_cache(self):
+        """Release compiled graphs/metadata after external weight updates."""
+        runtime = getattr(self, "_vision_runtime", None)
+        if runtime is not None:
+            runtime.clear()
+        self._vision_runtime = None
+
+    def _apply(self, fn, *args, **kwargs):
+        self.clear_vision_cache()
+        return super()._apply(fn, *args, **kwargs)
+
+    def load_state_dict(self, *args, **kwargs):
+        self.clear_vision_cache()
+        return super().load_state_dict(*args, **kwargs)
+
+    def vision_stats(self):
+        runtime = getattr(self, "_vision_runtime", None)
+        return dict(runtime.stats) if runtime is not None else {}
+
+    def forward(self, hidden_states, grid_thw, **kwargs):
+        mode = getattr(
+            self,
+            "_vision_mode",
+            getattr(
+                self.config,
+                "vision_execution_mode",
+                os.environ.get("RTP_QWEN35_VISION_MODE", "optimized"),
+            ),
+        )
+        if (
+            mode == "baseline"
+            or self.training
+            or torch.is_grad_enabled()
+            or hidden_states.device.type != "cuda"
+            # Internal/PPU patches own their attention and RoPE execution path.
+            or Qwen3_5MoeVisionAttention.forward.__module__ != __name__
+            or apply_rotary_pos_emb_vision.__module__ != __name__
+            or kwargs
+        ):
+            return self._forward_reference(hidden_states, grid_thw, **kwargs)
+        try:
+            from .qwen3_5_vision_cuda import VisionRuntime
+        except ImportError as exc:
+            logging.warning(
+                "Qwen3.5 vision CUDA dependencies unavailable; using reference: %s", exc
+            )
+            self._vision_mode = "baseline"
+            return self._forward_reference(hidden_states, grid_thw, **kwargs)
+
+        runtime = getattr(self, "_vision_runtime", None)
+        if runtime is None:
+            runtime = VisionRuntime(self, mode, **getattr(self, "_vision_options", {}))
+            self._vision_runtime = runtime
+        hidden, pooled = runtime(hidden_states, grid_thw)
+        return BaseModelOutputWithPooling(
+            last_hidden_state=hidden, pooler_output=pooled
+        )
+
+    def _forward_reference(
         self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         """
