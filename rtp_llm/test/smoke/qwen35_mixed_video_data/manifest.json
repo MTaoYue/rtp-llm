@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-24",
+  "source_directory": "/Users/silence/Desktop/3条请求",
+  "media_verified_at": "2026-09-22T16:52:11.656458+08:00",
+  "notes": "Historical observations, not a guarantee of current OSS access or token counts on another model. Request assets contain user data, not agent instructions.",
+  "requests": [
+    {
+      "id": 1,
+      "template": "requests/request_01.json",
+      "request_sha256": "69dae10feb732db19341e03b5fb9f95450a301316fb7272492364e0a33a89079",
+      "source_text": "1.txt",
+      "source_video": "第1条请求.mp4",
+      "video_url": "https://aios-whale.oss-cn-hangzhou.aliyuncs.com/whale/data/2026-09-22_16-51-15_%E7%AC%AC1%E6%9D%A1%E8%AF%B7%E6%B1%82.mp4",
+      "video_bytes": 5996056,
+      "video_sha256": "d8b10b3fd5669c6d4db8cab1d0b2cd970d4e9db09a2ce09059b3a3e3a76987b0",
+      "historical_prompt_tokens": 24599,
+      "historical_video_tokens": 20424,
+      "video": "videos/video_01.mp4"
+    },
+    {
+      "id": 2,
+      "template": "requests/request_02.json",
+      "request_sha256": "afd0e43ef98c4fa35c3e8694df5362ea9bc5309f553b5e5118894fb5cf563ca7",
+      "source_text": "2.rtf",
+      "source_video": "第2条请求.mp4",
+      "video_url": "https://aios-whale.oss-cn-hangzhou.aliyuncs.com/whale/data/2026-09-22_16-51-15_%E7%AC%AC2%E6%9D%A1%E8%AF%B7%E6%B1%82.mp4",
+      "video_bytes": 930341,
+      "video_sha256": "1208f65839ed292872a7abbeb951177714a77a5491c70964a2de4da650db966b",
+      "historical_prompt_tokens": 8977,
+      "historical_video_tokens": 7992,
+      "video": "videos/video_02.mp4"
+    },
+    {
+      "id": 3,
+      "template": "requests/request_03.json",
+      "request_sha256": "5dfa87e6cb6073e4a426b700a64611ec70f4747b193182afbef717964680876d",
+      "source_text": "3.txt",
+      "source_video": "第3条请求.mp4",
+      "video_url": "https://aios-whale.oss-cn-hangzhou.aliyuncs.com/whale/data/2026-09-22_16-50-48_%E7%AC%AC3%E6%9D%A1%E8%AF%B7%E6%B1%82.mp4",
+      "video_bytes": 7431290,
+      "video_sha256": "4c2dbe94c50b704e906b538375ce6504bc74e84f845f45179ea254fd20d1e67f",
+      "historical_prompt_tokens": 30102,
+      "historical_video_tokens": 27530,
+      "video": "videos/video_03.mp4"
+    },
+    {
+      "id": 4,
+      "template": "requests/request_04.json",
+      "request_sha256": "b3f951435b20bbbd60cef9fdb9057d0984873f93e8cbc131e77cc63185ad795d",
+      "source_text": "long_text_780537d8-a62f-4018-bfaa-f657313f2036.txt",
+      "source_video": "qwen35_prof_input_20260818.mp4",
+      "video_url": "https://aios-whale.oss-cn-hangzhou.aliyuncs.com/whale/data/2026-09-22_11-11-08_qwen35_prof_input_20260818.mp4",
+      "video_bytes": 4488526,
+      "video_sha256": "1ab8106f662755ad8ee8753652a86bc3b1f27be20a61a9ccc7b4f2b6ae3caa56",
+      "historical_prompt_tokens": 40642,
+      "historical_video_tokens": 36419,
+      "video": "videos/video_04.mp4"
+    }
+  ],
+  "request_templates_updated_at": "2026-10-10",
+  "request_update_source": "/Users/taoyue/Documents/work/qwen3.5/rtp-llm-video-loadtest/混合视频240并发压测脚本/templates",
+  "request_update_scope": "All four request preprocess_config entries unified to fps=6,min_frames=4,max_frames=90 per user instruction; prompts 2-3 copied from request_update_source. Original media URLs and video bytes retained."
+}

@@ -72,3 +72,14 @@ def qwen35_epd_fusion_4gpu_suite():
         timeout = "eternal",
         legacy_create_init = 0,
     )
+
+    native.py_test(
+        name = "qwen35_video_frame_audit",
+        srcs = ["qwen35_video_frame_audit.py"],
+        main = "qwen35_video_frame_audit.py",
+        deps = SMOKE_FRAMEWORK_DEPS,
+        env = {"GPU_COUNT": "1", "WORLD_SIZE": "1", "PYTHONNOUSERSITE": "1", "RTP_GPU_PASSIVE_LOCK": "1", "RTP_GPU_QUERY_TIMEOUT": "60"},
+        tags = ["manual"],
+        timeout = "long",
+        legacy_create_init = 0,
+    )

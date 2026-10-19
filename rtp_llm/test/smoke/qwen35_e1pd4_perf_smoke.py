@@ -97,8 +97,14 @@ def add_arguments(parser):
     )
 
 
-def configure(a, parser):
-    for name, value in DEFAULTS.items():
+def configure(a, parser, *, allowed_concurrency=("512",)):
+    settings = dict(DEFAULTS)
+    if a.steady_concurrency not in allowed_concurrency:
+        parser.error(
+            "this preset supports --steady-concurrency=" + ",".join(allowed_concurrency)
+        )
+    settings["steady_concurrency"] = a.steady_concurrency
+    for name, value in settings.items():
         if getattr(a, name) != value:
             parser.error(
                 f"the performance preset fixes --{name.replace('_', '-')}={value}; "
@@ -123,7 +129,7 @@ def configure(a, parser):
     ] + [f"--test_env={key}={value}" for key, value in env.items()]
     a.preset_metadata = dict(
         reference_run=REFERENCE_RUN,
-        settings=DEFAULTS,
+        settings=settings,
         environment=env,
         deep_gemm_version=DEEP_GEMM_VERSION,
         deep_gemm_sha256=DEEP_GEMM_SHA256,

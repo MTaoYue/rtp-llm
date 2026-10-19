@@ -1,3 +1,4 @@
+load(":qwen35_e1pd4_mixed_video_perf_smoke.bzl", "qwen35_e1pd4_mixed_video_perf_suite")
 load(":qwen35_e1pd4_perf_smoke.bzl", "qwen35_e1pd4_perf_suite")
 load(":qwen35_epd_fusion_4gpu_smoke.bzl", "qwen35_epd_fusion_4gpu_suite")
 load(":qwen35_e2p4d2_repro.bzl", "qwen35_e2p4d2_repro_suite")
@@ -143,5 +144,24 @@ py_test(
     deps = ["//rtp_llm:requests"],
     legacy_create_init = 0,
     tags = ["manual"],
+    timeout = "moderate",
+)
+
+qwen35_e1pd4_mixed_video_perf_suite()
+
+py_test(
+    name = "qwen35_mixed_video_test",
+    srcs = [
+        "qwen35_mixed_video_test.py",
+        "qwen35_mixed_video.py",
+        "qwen35_e1pd4_mixed_video_perf_smoke.py",
+        "qwen35_e1pd4_perf_smoke.py",
+        "qwen35_epd_fusion_4gpu_smoke.py",
+    ],
+    main = "qwen35_mixed_video_test.py",
+    data = glob(["qwen35_mixed_video_data/**"]),
+    deps = ["//rtp_llm:requests"],
+    tags = ["manual"],
+    legacy_create_init = 0,
     timeout = "moderate",
 )

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import random
 import shlex
 import signal
 import statistics
@@ -81,8 +82,11 @@ def server_config(
     fp8_kv_cache=0,
     native_fp8_attn=0,
     seq_size_per_block=0,
+    max_input_tokens=32768,
 ):
     gpu_ids(gpus)
+    if max_input_tokens not in (32768, 65536):
+        raise ValueError("unsupported input capacity")
     if profile not in ("baseline", "fused", "flashinfer"):
         raise ValueError("unknown optimization profile: " + profile)
     if moe_strategy not in ("fp8_per_block_ep_normal", "mega_moe_fp8"):
@@ -137,6 +141,12 @@ def server_config(
         "--seq_size_per_block 2048 --kernel_seq_size_per_block 64 "
         "--fp8_kv_cache 0 --reuse_cache 0 --mm_cache_item_num 0 --url_cache_item_num 0"
     )
+    for option in (
+        "max_seq_len",
+        "max_batch_tokens_size",
+        "max_batch_tokens_without_cache",
+    ):
+        args = args.replace(f"--{option} 32768", f"--{option} {max_input_tokens}")
     args = args.replace("--fp8_kv_cache 0", f"--fp8_kv_cache {fp8_kv_cache}")
     args = args.replace(
         "--seq_size_per_block 2048", f"--seq_size_per_block {seq_size_per_block}"
@@ -1436,6 +1446,10 @@ def validate_response(result, expected):
         errors.append("missing/invalid PDFUSION evidence")
     if aux.get("reuse_len") != 0:
         errors.append("missing/invalid cache evidence")
+    if expected.get("fixture_id") in (1, 2, 3, 4):
+        from qwen35_mixed_video import validate_content
+
+        errors.extend(validate_content(result.get("content") or "", expected["fixture_id"]))
     if result.get("error"):
         errors.append(result["error"])
     return errors
@@ -1444,6 +1458,11 @@ def validate_response(result, expected):
 def request(url, payload, index, expected):
     import requests
 
+    fixture_id = None
+    if isinstance(payload, list):
+        selected = random.SystemRandom().choice(payload)
+        fixture_id, payload = selected["id"], selected["payload"]
+        expected = expected["by_fixture"][str(fixture_id)]
     begin = time.monotonic()
     cpu_begin = time.thread_time()
     profiler = None
@@ -1461,6 +1480,8 @@ def request(url, payload, index, expected):
         "choices": {},
         "expected_choices": payload.get("n", 1),
     }
+    if fixture_id is not None:
+        result["fixture_id"] = fixture_id
     result.update(
         client_begin_wall=time.time(),
         sse_events=0,
@@ -1479,61 +1500,80 @@ def request(url, payload, index, expected):
             timeout=(10, 1200),
         ) as response:
             result["http_status"] = response.status_code
+            if payload.get("stream") is False and response.status_code != 200:
+                result["raw_response"] = response.text
             response.raise_for_status()
             result["headers_s"] = time.monotonic() - begin
             read_begin, read_cpu = time.monotonic(), time.thread_time()
-            for line in response.iter_lines(chunk_size=CLIENT_OPTIONS["chunk_size"]):
-                received = time.monotonic()
-                result["read_wall_s"] += received - read_begin
-                result["read_cpu_s"] += time.thread_time() - read_cpu
-                result["sse_line_bytes"] += len(line)
-                read_begin, read_cpu = time.monotonic(), time.thread_time()
-                if time.monotonic() - begin > 1200:
-                    raise TimeoutError("request exceeded 1200 seconds")
-                if not line.startswith(b"data:"):
-                    continue
-                body = line[5:].strip()
-                if body == b"[DONE]":
-                    result["done"] = True
-                    break
-                parse_begin, parse_cpu = time.monotonic(), time.thread_time()
-                obj = json.loads(body)
-                result["sse_events"] += 1
-                if isinstance(obj.get("debug_info"), dict):
-                    result["generation_debug"] = {
-                        key: value
-                        for key, value in obj["debug_info"].items()
-                        if key
-                        in (
-                            "generate_config",
-                            "eos_token_id",
-                            "stop_word_ids_list",
-                            "stop_words_list",
-                        )
-                    }
+            if payload.get("stream") is False:
+                result["raw_response"] = response.text
+                obj = json.loads(result["raw_response"])
+                result["usage"] = obj.get("usage") or {}
+                result["aux_info"] = obj.get("aux_info") or {}
                 if obj.get("error"):
                     raise RuntimeError(str(obj["error"]))
-                if obj.get("usage"):
-                    result["usage"] = obj["usage"]
-                    result["last_usage_received_s"] = received - begin
-                if obj.get("aux_info"):
-                    result["aux_info"].update(obj["aux_info"])
                 for choice in obj.get("choices", []):
-                    content = choice.get("delta", {}).get("content") or ""
-                    if content and "ttft_s" not in result:
-                        result["ttft_s"] = time.monotonic() - begin
+                    content = choice.get("message", {}).get("content") or ""
                     result["content"] += content
-                    choice_result = result["choices"].setdefault(
-                        str(choice.get("index", 0)), {"content": ""}
+                    result["choices"][str(choice.get("index", 0))] = dict(
+                        content=content, finish_reason=choice.get("finish_reason")
                     )
-                    choice_result["content"] += content
-                    if choice.get("finish_reason"):
-                        result["finish_reason"] = choice["finish_reason"]
-                        choice_result["finish_reason"] = choice["finish_reason"]
-                        result["finish_received_s"] = received - begin
-                result["parse_cpu_s"] += time.thread_time() - parse_cpu
-                result["parse_wall_s"] += time.monotonic() - parse_begin
-                read_begin, read_cpu = time.monotonic(), time.thread_time()
+                    result["finish_reason"] = choice.get("finish_reason")
+            else:
+                for line in response.iter_lines(
+                    chunk_size=CLIENT_OPTIONS["chunk_size"]
+                ):
+                    received = time.monotonic()
+                    result["read_wall_s"] += received - read_begin
+                    result["read_cpu_s"] += time.thread_time() - read_cpu
+                    result["sse_line_bytes"] += len(line)
+                    read_begin, read_cpu = time.monotonic(), time.thread_time()
+                    if time.monotonic() - begin > 1200:
+                        raise TimeoutError("request exceeded 1200 seconds")
+                    if not line.startswith(b"data:"):
+                        continue
+                    body = line[5:].strip()
+                    if body == b"[DONE]":
+                        result["done"] = True
+                        break
+                    parse_begin, parse_cpu = time.monotonic(), time.thread_time()
+                    obj = json.loads(body)
+                    result["sse_events"] += 1
+                    if isinstance(obj.get("debug_info"), dict):
+                        result["generation_debug"] = {
+                            key: value
+                            for key, value in obj["debug_info"].items()
+                            if key
+                            in (
+                                "generate_config",
+                                "eos_token_id",
+                                "stop_word_ids_list",
+                                "stop_words_list",
+                            )
+                        }
+                    if obj.get("error"):
+                        raise RuntimeError(str(obj["error"]))
+                    if obj.get("usage"):
+                        result["usage"] = obj["usage"]
+                        result["last_usage_received_s"] = received - begin
+                    if obj.get("aux_info"):
+                        result["aux_info"].update(obj["aux_info"])
+                    for choice in obj.get("choices", []):
+                        content = choice.get("delta", {}).get("content") or ""
+                        if content and "ttft_s" not in result:
+                            result["ttft_s"] = time.monotonic() - begin
+                        result["content"] += content
+                        choice_result = result["choices"].setdefault(
+                            str(choice.get("index", 0)), {"content": ""}
+                        )
+                        choice_result["content"] += content
+                        if choice.get("finish_reason"):
+                            result["finish_reason"] = choice["finish_reason"]
+                            choice_result["finish_reason"] = choice["finish_reason"]
+                            result["finish_received_s"] = received - begin
+                    result["parse_cpu_s"] += time.thread_time() - parse_cpu
+                    result["parse_wall_s"] += time.monotonic() - parse_begin
+                    read_begin, read_cpu = time.monotonic(), time.thread_time()
     except Exception as error:
         result["error"] = repr(error)
     result["e2e_s"] = time.monotonic() - begin
@@ -2033,7 +2073,12 @@ def run_worker(a):
         fp8_kv_cache,
         native_fp8_attn,
         seq_size_per_block,
+        getattr(a, "max_input_tokens", 32768),
     )
+    if getattr(a, "mixed_video", False):
+        env.update(
+            getattr(a, "preset_metadata", {}).get("environment", {})
+        )
     policy = getattr(a, "scheduler_policy", "fifo")
     throughput = getattr(a, "throughput_sweep", 0)
     env, args = throughput_config(
@@ -2129,7 +2174,17 @@ def run_worker(a):
         report["gpu_before_model"] = check_gpu_idle(selected)
         report["phase"] = "fixture"
         data = Path(a.data_dir).resolve()
-        if workload == "video":
+        if getattr(a, "mixed_video", False):
+            from qwen35_mixed_video import load_workload, expected_inputs
+
+            payload, fixture = load_workload(
+                data, omit_max_tokens=getattr(a, "omit_max_tokens", False)
+            )
+            expected = {
+                "by_fixture": expected_inputs(a.model_dir, payload, a.max_input_tokens)
+            }
+            save(out / "fixture-manifest.json", fixture)
+        elif workload == "video":
             validate_fixture(data)
             payload = payload_for(data)
             report["phase"] = "dependency_and_input_validation"
@@ -2213,6 +2268,20 @@ def run_worker(a):
                 )
             for config in configs:
                 if config["name"].startswith("encoder_dp"):
+                    if getattr(a, "mixed_video", False):
+                        from qwen35_mixed_video import (
+                            ENCODER_VIDEO_TOTAL_MIN_PIXELS,
+                            ENCODER_VIDEO_TOTAL_MAX_PIXELS,
+                        )
+
+                        config["env"].update(
+                            MM_VIDEO_TOTAL_MIN_PIXELS=str(ENCODER_VIDEO_TOTAL_MIN_PIXELS),
+                            MM_VIDEO_TOTAL_MAX_PIXELS=str(ENCODER_VIDEO_TOTAL_MAX_PIXELS),
+                        )
+                        config["args"] += (
+                            f" --mm_video_total_min_pixels {ENCODER_VIDEO_TOTAL_MIN_PIXELS}"
+                            f" --mm_video_total_max_pixels {ENCODER_VIDEO_TOTAL_MAX_PIXELS}"
+                        )
                     config["env"]["CUDA_COREDUMP_FILE"] = str(
                         out / "cuda_coredump_%h.%p.%t"
                     )
@@ -2326,7 +2395,14 @@ def run_worker(a):
                     "fixed-length preflight failed; no throughput measurement started"
                 )
         if steady_concurrency and encoder_gpus:
-            warmup = run_throughput_batch(manager, payload, expected, 4, 4)
+            if isinstance(payload, list):
+                from qwen35_mixed_video import preflight
+
+                report["phase"] = "mixed_video_preflight"
+                save(out / "result.json", report)
+                warmup = preflight(manager, payload, expected, out, request, save)
+            else:
+                warmup = run_throughput_batch(manager, payload, expected, 4, 4)
             save(out / "encoder-preflight.json", warmup)
             if not all(row["ok"] for row in warmup):
                 raise RuntimeError("encoder video preflight failed")
@@ -2336,6 +2412,9 @@ def run_worker(a):
                 raise RuntimeError(
                     "all configured Encoder workers must complete preflight"
                 )
+        if getattr(a, "preflight_only", False):
+            report["preflight_only"] = True
+            phases = []
         capacity_refined = False
         encoder_warmup_batches = 0
         while phases:
@@ -2359,6 +2438,28 @@ def run_worker(a):
                     phase,
                 )
                 count = len(results)
+                if isinstance(payload, list):
+                    from qwen35_mixed_video import summarize
+
+                    steady["by_fixture"] = summarize(
+                        results,
+                        a.steady_warmup_seconds,
+                        a.steady_window_seconds,
+                        a.steady_windows,
+                        steady_summary,
+                    )
+                    steady["mixed_acceptance"] = (
+                        steady["all_valid"]
+                        and not steady.get("aborted", False)
+                        and all(
+                            w["successful"] > 0 and w["errors"] == 0
+                            for w in steady["rounds"]
+                        )
+                        and all(
+                            v["measurement"]["successful"] > 0
+                            for v in steady["by_fixture"].values()
+                        )
+                    )
                 report["steady"][phase] = steady
                 save(out / "steady-summary.json", report["steady"])
             elif throughput or capacity_batches:
@@ -2435,6 +2536,10 @@ def run_worker(a):
                         capacity_refined = True
             if not all(r["ok"] for r in results):
                 raise RuntimeError(phase + " failed response validation")
+            if isinstance(payload, list) and not steady["mixed_acceptance"]:
+                raise RuntimeError(
+                    "mixed workload missing valid windows or fixture coverage"
+                )
             if encoder_gpus and phase.startswith("warmup"):
                 encoder_warmup_batches += 1
                 evidence = encoder_log_evidence(out, len(encoder_gpu_ids(encoder_gpus)))
@@ -2549,6 +2654,13 @@ def bazel_command(a):
         "--test_env=RTP_GPU_QUERY_TIMEOUT=60",
         "--test_env=RTP_GPU_PASSIVE_LOCK=1",
     ]
+    if getattr(a, "mixed_video", False):
+        command.append("--test_arg=--mixed-video")
+    command.append(
+        "--test_arg=--max-input-tokens=" + str(getattr(a, "max_input_tokens", 32768))
+    )
+    if getattr(a, "preflight_only", False):
+        command.append("--test_arg=--preflight-only")
     command += a.bazel_option
     command += ["--test_arg=" + value for value in getattr(a, "extra_test_args", ())]
     for name, value in (
@@ -2621,7 +2733,13 @@ def run_launcher(a):
     print(shlex.join(public), flush=True)
     if not a.execute:
         return 0
-    if a.workload == "video":
+    if getattr(a, "mixed_video", False):
+        from qwen35_mixed_video import load_workload
+
+        load_workload(
+            Path(a.data_dir), omit_max_tokens=getattr(a, "omit_max_tokens", False)
+        )
+    elif a.workload == "video":
         validate_fixture(Path(a.data_dir))
     if not Path(a.model_dir).is_dir():
         raise ValueError("model directory does not exist")
@@ -2740,6 +2858,15 @@ def main(argv=None, preset=None):
     p.add_argument("--model-dir", default=DEFAULT_MODEL)
     p.add_argument("--gpus", default="0,1,2,3", help="four PDFUSION GPUs")
     p.add_argument("--workload", choices=("video", "text"), default="video")
+    p.add_argument("--mixed-video", action="store_true")
+    p.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="run mixed video serial/concurrent validation without steady load",
+    )
+    p.add_argument(
+        "--max-input-tokens", type=int, choices=(32768, 65536), default=32768
+    )
     p.add_argument(
         "--encoder-dp2",
         "--encoder-proxy",
@@ -2860,6 +2987,20 @@ def main(argv=None, preset=None):
     for field in ("model_dir", "data_dir", "output", "cache_root"):
         setattr(a, field, str(Path(getattr(a, field)).resolve()))
     selected_gpus(a.gpus, a.encoder_gpus)
+    if a.preflight_only and not a.mixed_video:
+        p.error("--preflight-only requires --mixed-video")
+    if a.mixed_video and (
+        a.workload != "video"
+        or not a.encoder_gpus
+        or not a.encoder_dp2
+        or not a.steady_concurrency
+        or a.client_mode != "measured"
+        or a.fixed_output_tokens
+        or a.max_input_tokens != 65536
+    ):
+        p.error(
+            "mixed video requires measured Encoder proxy steady load, natural output and capacity 65536"
+        )
     env, args = server_config(
         a.gpus,
         a.profile,
@@ -2868,6 +3009,7 @@ def main(argv=None, preset=None):
         a.fp8_kv_cache,
         a.native_fp8_attn,
         a.seq_size_per_block,
+        a.max_input_tokens,
     )
     capacity_config(
         env,

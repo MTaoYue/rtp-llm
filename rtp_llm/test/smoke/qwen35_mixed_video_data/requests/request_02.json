@@ -1,0 +1,29 @@
+{
+  "model": "qwen35_moe",
+  "temperature": 0,
+  "max_tokens": 8192,
+  "stream": false,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "# Visual Event Annotation\n\nYou are a video analyst. Examine the supplied video's visible frames and produce a chronological annotation of scenes and visible events. This task uses visual input only; no audio evidence is available or required.\n\n## Evidence rules\n- Base every statement on visible frames. Do not infer sounds, music, speech, spoken language, or vocal emotion from objects, mouth movements, captions, or actions.\n- Describe visible actions directly: for example, hands coming together, an object falling, or a vehicle moving. Do not claim that these actions produce audible sounds.\n- On-screen text is visual text, not a transcript of speech. Copy only clearly readable text in its original language, without translating or completing obscured words.\n- Do not invent hidden actions, off-screen events, identities, intentions, causes, or details between sampled frames. Omit uncertain details.\n- Use English for descriptions, except for verbatim on-screen text. Be specific and concise; avoid repeating unchanged details.\n\n## Annotation categories\n### scenes\nIdentify visually distinct shots or substantial changes of setting. Describe the visible setting, major objects, lighting, colors, spatial layout, and framing. Keep a continuous unchanged scene in one entry. A camera cut may create a new scene entry even when the location stays the same; describe only what changes and any newly revealed details.\n\n### visual_events\nDescribe meaningful visible actions, interactions, movement, and state changes in chronological order. Include the relevant subject or object, its frame-relative position, the observed action, and any visible outcome. Track motion toward the left/right/top/bottom of the frame where supported. Merge a continuous or repetitive action into one event; separate clearly different actions. Overlapping events are allowed when multiple actions occur at once. A static clip may have no visual events.\n\n### on_screen_text\nRecord clearly readable captions, titles, labels, logos with readable lettering, or other relevant visible text. Include its position in the frame. Combine text that remains unchanged across consecutive frames into one entry. Do not guess unreadable text or interpret subtitles as evidence of audible dialogue.\n\n## Time rules\n- Use the video timestamps supplied with the frames, when available. Format start and end as MM:SS.s, with one decimal place. This is a display format, not a claim of sub-frame accuracy.\n- Bound each interval by the earliest and latest visible evidence for that scene, action, or text. Do not extrapolate beyond the available frames or video duration.\n- For an event visible in only one frame, start and end may be equal. Sampling may miss the true onset or ending; do not claim exact boundaries that are not observable.\n- If timestamps cannot be reliably determined, set start and end to null and retain chronological array order. Do not invent timing.\n\n## Output\nReturn one valid JSON object only, without Markdown fences or additional commentary. Use exactly the three top-level keys shown below. Each scene and visual event entry must contain start, end, and description. Each on-screen text entry must contain start, end, text, and position. Time fields are strings or null; all other fields are strings. Use an empty array when no qualifying item is visible. The empty arrays below specify structure, not a suggested answer.\n\n{\n  \"scenes\": [],\n  \"visual_events\": [],\n  \"on_screen_text\": []\n}\n\nReview all supplied frames, including the beginning, middle, and end. Cover the important visible content without padding, unsupported detail, or audio-related annotations.\n"
+        },
+        {
+          "type": "video_url",
+          "video_url": {
+            "url": "https://aios-whale.oss-cn-hangzhou.aliyuncs.com/whale/data/2026-09-22_16-51-15_%E7%AC%AC2%E6%9D%A1%E8%AF%B7%E6%B1%82.mp4",
+            "detail": "auto"
+          },
+          "preprocess_config": {
+            "fps": 6,
+            "min_frames": 4,
+            "max_frames": 90
+          }
+        }
+      ]
+    }
+  ]
+}
